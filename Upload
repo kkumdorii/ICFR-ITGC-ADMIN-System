@@ -1,0 +1,519 @@
+/**
+ * Upload.gs — 증빙 업로드 · 폴더 스캔 · 수집 현황
+ *
+ * 폴더 구조: 01_증빙 / {기수} / {통제코드} / {평가단위ID} / 파일
+ *
+ * 증빙이 들어오는 경로는 두 가지다.
+ *   1) 웹앱 업로드      — 용량 한도 이내. 확장자·파일명이 그 자리에서 통제됨
+ *   2) Drive 직접 업로드 — 대용량. 나중에 스캔해서 시스템에 등록
+ * 둘 다 최종적으로 T_증빙파일에 기록된다.
+ */
+
+/* ─────────────── 공통 ─────────────── */
+
+/**
+ * 파일 생성·채번 구간을 직렬화한다.
+ * 동시에 저장하면 파일명과 파일ID가 겹칠 수 있어 반드시 잠근다.
+ */
+function withLock(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    throw new Error('다른 사용자가 저장 중입니다. 잠시 후 다시 시도하십시오.');
+  }
+  try { return fn(); }
+  finally { lock.releaseLock(); }
+}
+
+function _allowExt(def) {
+  return String(def['허용확장자'] || '').toLowerCase()
+    .split(',').map(function (s) { return s.trim(); }).filter(String);
+}
+
+function _controlOf(euId) {
+  return String(euId).split('-')[1] || 'ETC';
+}
+
+/** 평가단위 폴더를 만들거나 찾는다 */
+function _euFolder(euId) {
+  var period = cfg('CURRENT_PERIOD');
+  return ensureFolderPath(cfg('FOLDER_EVIDENCE'), [period, _controlOf(euId), String(euId)]);
+}
+
+/** 파일명규칙 적용. 중복이면 뒤에 번호를 붙인다 */
+function _makeName(def, folder, ext, seqNo) {
+  var period = cfg('CURRENT_PERIOD');
+  var seq = seqNo || def['증빙순번'] || 1;
+  var name = String(def['파일명규칙'] || '{통제코드}_{기수}_{순번}')
+    .replace('{기수}', period)
+    .replace('{통제코드}', _controlOf(def['평가단위ID']))
+    .replace('{순번}', ('0' + seq).slice(-2));
+  if (name.indexOf('.') < 0) name += '.' + ext;
+  var base = name.replace(/\.[^.]+$/, ''), tail = name.substring(base.length);
+  var n = 1, out = name;
+  while (folder.getFilesByName(out).hasNext()) { n++; out = base + '_' + n + tail; }
+  return out;
+}
+
+/** T_증빙파일에 1건 기록 */
+function _register(file, def, seqNo) {
+  var me = currentUser();
+  var fileId = nextId('T_증빙파일', '파일ID', 'EV-', 6);
+  appendRow('T_증빙파일', {
+    '파일ID': fileId,
+    '평가기수': cfg('CURRENT_PERIOD'),
+    '평가단위ID': def['평가단위ID'],
+    '정의ID': def['정의ID'],
+    '모집단ID': '',
+    '표본순번': seqNo || '',
+    '파일명': file.getName(),
+    'DriveFileID': file.getId(),
+    'DriveURL': file.getUrl(),
+    '파일크기': file.getSize(),
+    '업로드자ID': me ? me['사용자ID'] : currentEmail(),
+    '업로드일시': now_(),
+    '상태': '업로드',
+    '반려사유': ''
+  });
+  return { fileId: fileId, name: file.getName(), url: file.getUrl(), size: file.getSize() };
+}
+
+/** Drive 공유 URL에서 파일ID를 뽑는다 */
+function _driveId(u) {
+  var m = String(u || '').match(/[-\w]{25,}/);
+  return m ? m[0] : '';
+}
+
+/* ─────────────── 화면 기동 ─────────────── */
+
+function getUploadContext() {
+  try {
+    var me = currentUser();
+    return {
+      ok: true,
+      email: currentEmail(),
+      me: me ? { id: me['사용자ID'], name: me['성명'], dept: me['소속부서'], role: me['역할'] } : null,
+      isAdmin: !!(me && (me['역할'] === '관리자' || me['역할'] === '검토자')),
+      period: cfg('CURRENT_PERIOD'),
+      dueDate: cfg('EVIDENCE_DUE_DATE'),
+      maxMb: Number(cfg('MAX_FILE_SIZE_MB') || 10),
+      users: getRows('M_사용자')
+        .filter(function (u) { return u['상태'] === '사용'; })
+        .map(function (u) {
+          return { id: u['사용자ID'], name: u['성명'], dept: u['소속부서'], role: u['역할'] };
+        })
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 증빙제출 화면 기동 — 컨텍스트와 목록을 한 번에 반환한다 (호출 1회) */
+function getUploadPage(userId) {
+  var ctx = getUploadContext();
+  if (!ctx.ok) return ctx;
+  var uid = userId || (ctx.me ? ctx.me.id : '');
+  var ev = uid ? getMyEvidence(uid) : { ok: true, items: [], userId: '' };
+  return { ok: true, ctx: ctx, ev: ev };
+}
+
+function getMyEvidence(userId) {
+  try {
+    var uid = userId;
+    if (!uid) {
+      var me = currentUser();
+      if (!me) return { ok: false, error: 'M_사용자에 등록되지 않은 계정입니다: ' + currentEmail() };
+      uid = me['사용자ID'];
+    }
+    var period = cfg('CURRENT_PERIOD');
+    var euMap = {};
+    getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+
+    var files = {};
+    getRows('T_증빙파일').forEach(function (f) {
+      if (String(f['평가기수']) !== period || f['상태'] === '삭제') return;
+      var k = String(f['정의ID']);
+      (files[k] = files[k] || []).push({
+        fileId: f['파일ID'], name: f['파일명'], url: f['DriveURL'],
+        size: f['파일크기'], at: f['업로드일시']
+      });
+    });
+
+    var infMap = {};
+    getRows('M_인프라').forEach(function (x) { infMap[String(x['인프라ID'])] = x; });
+    var pst = String(cfg('PERIOD_START')).substring(0, 10);
+    var pen = String(cfg('PERIOD_END')).substring(0, 10);
+    var tdy = now_().substring(0, 10);
+
+    var items = getRows('T_증빙정의')
+      .filter(function (d) { return d['상태'] === '사용' && String(d['담당자ID']) === String(uid); })
+      .map(function (d) {
+        var eu = euMap[String(d['평가단위ID'])] || {};
+        return {
+          defId: d['정의ID'], euId: d['평가단위ID'], seq: d['증빙순번'],
+          type: d['증빙유형'], desc: d['증빙설명'], required: d['필수여부'],
+          ext: d['허용확장자'], method: d['모집단추출방법'],
+          control: eu['통제코드'] || '', target: eu['대상명'] || '',
+          rangeLabel: _evRange(d, eu, infMap, pst, pen, tdy).label,
+          exUrl: d['예시파일URL'] || '', exId: _driveId(d['예시파일URL']),
+          exText: d['예시내용'] || '', exDesc: d['예시설명'] || '',
+          files: files[String(d['정의ID'])] || []
+        };
+      })
+      .sort(function (a, b) { return a.euId === b.euId ? (a.seq - b.seq) : (a.euId < b.euId ? -1 : 1); });
+
+    return { ok: true, userId: uid, period: period, items: items };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 웹앱 업로드 ─────────────── */
+
+function uploadEvidence(p) {
+  try {
+    assertUnlocked();
+    var def = findRow('T_증빙정의', '정의ID', p.defId);
+    if (!def) throw new Error('증빙정의를 찾을 수 없습니다: ' + p.defId);
+
+    var ext = String(p.fileName).split('.').pop().toLowerCase();
+    var allow = _allowExt(def);
+    if (allow.length && allow.indexOf(ext) < 0) {
+      throw new Error('허용되지 않는 확장자입니다. 허용: ' + allow.join(', '));
+    }
+    var bytes = Utilities.base64Decode(p.data);
+    var maxMb = Number(cfg('MAX_FILE_SIZE_MB') || 10);
+    if (bytes.length > maxMb * 1024 * 1024) {
+      throw new Error(maxMb + 'MB를 초과합니다. 폴더에 직접 올린 뒤 [수집 확인]을 눌러주십시오.');
+    }
+
+    var r = withLock(function () {
+      var folder = _euFolder(def['평가단위ID']);
+      var name = _makeName(def, folder, ext, p.seqNo);
+      var file = folder.createFile(
+        Utilities.newBlob(bytes, p.mimeType || 'application/octet-stream', name));
+      return _register(file, def, p.seqNo);
+    });
+    return { ok: true, fileId: r.fileId, name: r.name, url: r.url, size: r.size };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function removeEvidence(fileId) {
+  try {
+    assertUnlocked();
+    var rec = findRow('T_증빙파일', '파일ID', fileId);
+    if (!rec) throw new Error('파일 기록을 찾을 수 없습니다');
+    try { DriveApp.getFileById(rec['DriveFileID']).setTrashed(true); } catch (e) { }
+    updateCell('T_증빙파일', rec._row, '상태', '삭제');
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 평가단위 폴더 URL. 없으면 만든다 (직접 업로드용 링크) */
+function getEvidenceFolderUrl(euId) {
+  try {
+    return { ok: true, url: _euFolder(euId).getUrl() };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * 붙여넣은 표를 xlsx(또는 csv)로 저장한다.
+ * 임시 스프레드시트를 만들어 export 한 뒤 폐기하는 방식.
+ * @param {Object} p {defId, rows:[[..],[..]]}
+ */
+function uploadTable(p) {
+  var tempId = null;
+  try {
+    assertUnlocked();
+    var def = findRow('T_증빙정의', '정의ID', p.defId);
+    if (!def) throw new Error('증빙정의를 찾을 수 없습니다: ' + p.defId);
+    var rows = p.rows || [];
+    if (!rows.length) throw new Error('저장할 내용이 없습니다');
+
+    var allow = _allowExt(def);
+    var ext = (allow.indexOf('xlsx') >= 0) ? 'xlsx'
+            : (allow.indexOf('csv') >= 0) ? 'csv' : null;
+    if (!ext) throw new Error('이 증빙은 표 붙여넣기를 지원하지 않습니다. 허용: ' + allow.join(', '));
+
+    var folder = _euFolder(def['평가단위ID']);
+    var name = withLock(function () { return _makeName(def, folder, ext, p.seqNo); });
+    var blob;
+
+    if (ext === 'csv') {
+      var csv = rows.map(function (r) {
+        return r.map(function (c) {
+          var v = String(c == null ? '' : c);
+          return (v.indexOf('"') >= 0 || v.indexOf(',') >= 0 || v.indexOf('\n') >= 0)
+            ? '"' + v.replace(/"/g, '""') + '"' : v;
+        }).join(',');
+      }).join('\r\n');
+      blob = Utilities.newBlob('\uFEFF' + csv, 'text/csv', name);
+    } else {
+      /* 행 길이를 맞춘 뒤 임시 시트에 기록하고 xlsx로 내보낸다 */
+      var cols = 0;
+      rows.forEach(function (r) { if (r.length > cols) cols = r.length; });
+      var grid = rows.map(function (r) {
+        var out = r.slice();
+        while (out.length < cols) out.push('');
+        return out.map(function (c) { return c == null ? '' : String(c); });
+      });
+      var temp = SpreadsheetApp.create(name.replace(/\.xlsx$/, ''));
+      tempId = temp.getId();
+      var sh = temp.getSheets()[0];
+      sh.setName('데이터');
+      sh.getRange(1, 1, grid.length, cols).setValues(grid);
+      sh.getRange(1, 1, 1, cols).setFontWeight('bold').setBackground('#DCE6F0');
+      sh.setFrozenRows(1);
+
+      /* 붙여넣은 원본을 그대로 남긴다. 가공 과정에서 잃은 정보가 없는지 대조할 수 있어야 한다 */
+      if (p.raw && String(p.raw).trim()) {
+        var s2 = temp.insertSheet('원본');
+        var lines = String(p.raw).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+        var head = [['담당자가 붙여넣은 원본 텍스트 (' + lines.length + '행)'],
+                    ['가공 결과는 [데이터] 시트를 보십시오'], ['']];
+        var body = lines.map(function (x) { return [x]; });
+        var all = head.concat(body);
+        s2.getRange(1, 1, all.length, 1).setValues(all);
+        s2.getRange(1, 1).setFontWeight('bold');
+        s2.getRange(2, 1).setFontColor('#808080');
+        s2.setColumnWidth(1, 900);
+      }
+      SpreadsheetApp.flush();
+
+      var url = 'https://docs.google.com/spreadsheets/d/' + tempId + '/export?format=xlsx';
+      blob = UrlFetchApp.fetch(url, {
+        headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+        muteHttpExceptions: false
+      }).getBlob().setName(name);
+    }
+
+    var r = withLock(function () {
+      return _register(folder.createFile(blob), def, p.seqNo);
+    });
+    return { ok: true, fileId: r.fileId, name: r.name, url: r.url, size: r.size,
+             rows: rows.length, ext: ext };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    if (tempId) { try { DriveApp.getFileById(tempId).setTrashed(true); } catch (e) { } }
+  }
+}
+
+/**
+ * 예시 파일을 읽어 화면에 바로 띄울 수 있는 형태로 반환한다.
+ * Drive 썸네일은 사내 설정에 따라 생성되지 않을 수 있어 파일을 직접 읽는다.
+ */
+function getExampleFile(defId) {
+  try {
+    var def = findRow('T_증빙정의', '정의ID', defId);
+    if (!def) throw new Error('증빙정의를 찾을 수 없습니다: ' + defId);
+    var raw = String(def['예시파일URL'] || '').trim();
+    if (!raw) throw new Error('예시 파일이 지정되어 있지 않습니다');
+    var id = _driveId(raw);
+    if (!id) return { ok: true, kind: 'link', url: raw, name: '예시 파일' };
+
+    var f;
+    try { f = DriveApp.getFileById(id); }
+    catch (err) { return { ok: true, kind: 'link', url: raw, name: '예시 파일' }; }
+
+    var mime = f.getMimeType(), name = f.getName(), size = f.getSize(), url = f.getUrl();
+    if (String(mime).indexOf('image') !== 0) {
+      return { ok: true, kind: 'link', url: url, name: name, mime: mime, size: size };
+    }
+
+    /* 1순위: Drive API의 thumbnailLink.
+       브라우저가 Google CDN에서 직접 받으므로 응답이 링크 문자열뿐이라 빠르다 */
+    var thumb = '';
+    try {
+      var res = UrlFetchApp.fetch(
+        'https://www.googleapis.com/drive/v3/files/' + id +
+        '?fields=thumbnailLink&supportsAllDrives=true',
+        { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+          muteHttpExceptions: true });
+      if (res.getResponseCode() === 200) {
+        var link = JSON.parse(res.getContentText()).thumbnailLink || '';
+        /* 기본 =s220 을 원하는 크기로 바꾼다 */
+        if (link) thumb = link.replace(/=s\d+(-c)?$/, '') + '=s1600';
+      }
+    } catch (e) { }
+
+    if (thumb) {
+      return { ok: true, kind: 'image', thumb: thumb, url: url, name: name, size: size };
+    }
+
+    /* 2순위: 파일을 직접 읽어 보낸다. 느리므로 8MB까지만 */
+    if (size > 8 * 1024 * 1024) {
+      return { ok: true, kind: 'link', url: url, name: name, mime: mime, size: size, tooBig: true };
+    }
+    return {
+      ok: true, kind: 'image', url: url, name: name, size: size,
+      data: 'data:' + mime + ';base64,' + Utilities.base64Encode(f.getBlob().getBytes())
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 폴더 스캔 ─────────────── */
+
+/**
+ * Drive에 직접 올라온 파일을 찾아 T_증빙파일에 등록한다.
+ * 확장자로 증빙정의가 하나로 특정되면 자동 연결, 아니면 미분류로 남긴다.
+ * @param {string[]} euIds 비우면 이번 기수 전체
+ */
+function scanEvidence(euIds) {
+  try {
+    assertUnlocked();
+    var period = cfg('CURRENT_PERIOD');
+    var root = DriveApp.getFolderById(cfg('FOLDER_EVIDENCE'));
+    var pIt = root.getFoldersByName(period);
+    if (!pIt.hasNext()) return { ok: true, assigned: [], unassigned: [], scanned: 0 };
+    var pf = pIt.next();
+
+    var known = {};
+    getRows('T_증빙파일').forEach(function (f) {
+      if (f['상태'] !== '삭제') known[String(f['DriveFileID'])] = 1;
+    });
+    var defsByEu = {};
+    getRows('T_증빙정의').forEach(function (d) {
+      if (d['상태'] !== '사용') return;
+      var k = String(d['평가단위ID']);
+      (defsByEu[k] = defsByEu[k] || []).push(d);
+    });
+    var filter = (euIds && euIds.length) ? euIds : null;
+
+    var assigned = [], unassigned = [], scanned = 0;
+    var cIt = pf.getFolders();
+    while (cIt.hasNext()) {
+      var eIt = cIt.next().getFolders();
+      while (eIt.hasNext()) {
+        var ef = eIt.next();
+        var euId = ef.getName();
+        if (filter && filter.indexOf(euId) < 0) continue;
+        var defs = defsByEu[euId] || [];
+        var fIt = ef.getFiles();
+        while (fIt.hasNext()) {
+          var file = fIt.next();
+          scanned++;
+          if (known[file.getId()]) continue;
+          var ext = file.getName().split('.').pop().toLowerCase();
+          var cands = defs.filter(function (d) {
+            var a = _allowExt(d);
+            return a.length === 0 || a.indexOf(ext) >= 0;
+          });
+          if (cands.length === 1) {
+            var def = cands[0];
+            (function (f, d, folder, x) {
+              withLock(function () {
+                try { f.setName(_makeName(d, folder, x)); } catch (e) { }
+                _register(f, d);
+              });
+            })(file, def, ef, ext);
+            assigned.push({ euId: euId, defId: def['정의ID'], name: file.getName(), type: def['증빙유형'] });
+          } else {
+            unassigned.push({
+              driveFileId: file.getId(), name: file.getName(), url: file.getUrl(),
+              size: file.getSize(), euId: euId, ext: ext,
+              reason: cands.length === 0 ? '확장자에 맞는 증빙정의 없음' : '증빙정의 ' + cands.length + '건에 해당',
+              candidates: defs.map(function (d) {
+                return { defId: d['정의ID'], seq: d['증빙순번'], type: d['증빙유형'], ext: d['허용확장자'] };
+              })
+            });
+          }
+        }
+      }
+    }
+    return { ok: true, assigned: assigned, unassigned: unassigned, scanned: scanned };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 미분류 파일을 증빙정의에 수동 연결 */
+function assignEvidence(driveFileId, defId) {
+  try {
+    assertUnlocked();
+    var def = findRow('T_증빙정의', '정의ID', defId);
+    if (!def) throw new Error('증빙정의를 찾을 수 없습니다: ' + defId);
+    var file = DriveApp.getFileById(driveFileId);
+    var dup = findRow('T_증빙파일', 'DriveFileID', driveFileId);
+    if (dup && dup['상태'] !== '삭제') throw new Error('이미 등록된 파일입니다');
+    var ext = file.getName().split('.').pop().toLowerCase();
+    var r = withLock(function () {
+      try { file.setName(_makeName(def, file.getParents().next(), ext)); } catch (e) { }
+      return _register(file, def);
+    });
+    return { ok: true, fileId: r.fileId, name: r.name };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 수집 현황 ─────────────── */
+
+function getCollectStatus() {
+  try {
+    var period = cfg('CURRENT_PERIOD');
+    var users = {};
+    getRows('M_사용자').forEach(function (u) { users[u['사용자ID']] = u; });
+    var euMap = {};
+    getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+
+    var uploaded = {};
+    getRows('T_증빙파일').forEach(function (f) {
+      if (String(f['평가기수']) !== period || f['상태'] === '삭제') return;
+      uploaded[String(f['정의ID'])] = (uploaded[String(f['정의ID'])] || 0) + 1;
+    });
+
+    var defs = getRows('T_증빙정의').filter(function (d) { return d['상태'] === '사용'; });
+    var byUser = {}, byEu = {}, rows = [];
+
+    defs.forEach(function (d) {
+      var did = String(d['정의ID']);
+      var done = !!uploaded[did];
+      var uid = String(d['담당자ID'] || '(미지정)');
+      var eu = euMap[String(d['평가단위ID'])] || {};
+
+      if (!byUser[uid]) byUser[uid] = { total: 0, done: 0 };
+      byUser[uid].total++; if (done) byUser[uid].done++;
+
+      var ek = String(d['평가단위ID']);
+      if (!byEu[ek]) byEu[ek] = { total: 0, done: 0, control: eu['통제코드'] || '', target: eu['대상명'] || '' };
+      byEu[ek].total++; if (done) byEu[ek].done++;
+
+      rows.push({
+        defId: did, euId: ek, seq: d['증빙순번'], type: d['증빙유형'],
+        control: eu['통제코드'] || '',
+        dept: users[uid] ? users[uid]['소속부서'] : '',
+        owner: users[uid] ? users[uid]['성명'] : (d['담당자ID'] || '(미지정)'),
+        count: uploaded[did] || 0, done: done
+      });
+    });
+
+    return {
+      ok: true, period: period,
+      summary: {
+        total: defs.length,
+        done: defs.filter(function (d) { return !!uploaded[String(d['정의ID'])]; }).length
+      },
+      byUser: Object.keys(byUser).sort().map(function (k) {
+        return {
+          userId: k, name: users[k] ? users[k]['성명'] : k,
+          dept: users[k] ? users[k]['소속부서'] : '',
+          total: byUser[k].total, done: byUser[k].done
+        };
+      }),
+      byEu: Object.keys(byEu).sort().map(function (k) {
+        return { euId: k, control: byEu[k].control, target: byEu[k].target, total: byEu[k].total, done: byEu[k].done };
+      }),
+      rows: rows
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
