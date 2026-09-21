@@ -366,6 +366,15 @@
   .seg-h .pd{color:#5A6E78}
   .seg-h .st{margin-left:auto;font-size:11px;font-weight:bold}
   .seg-b{padding:11px 13px}
+  .refbox{background:#F3F7FB;border:1px solid #CAD9E8;border-left:4px solid #2482C8;
+          border-radius:9px;padding:12px 15px;margin-top:11px;font-size:12px;
+          color:#2F5597;line-height:1.8}
+  .refbox b{color:#203864}
+  .up .m.shared{color:#176BCE;background:#F3F7FB;border-radius:4px;padding:3px 8px;display:inline-block}
+  .refbox .src{font-size:11.5px;color:#5A6E78;margin-top:3px;display:block}
+  .up.ref{background:#FAFCFE;border-left:3px solid #2482C8}
+  .ref-b{display:inline-block;background:#EDF4FB;color:#176BCE;border-radius:20px;
+         padding:3px 10px;font-size:11.5px;font-weight:bold;margin-left:9px}
   .parthint{background:#FBF4E3;border:1px solid #E8D9A8;border-radius:8px;padding:9px 12px;
             font-size:11.5px;color:#8A6508;line-height:1.75;margin-top:9px}
   .up .act{display:flex;gap:9px;align-items:center;margin-top:11px;flex-wrap:wrap}
@@ -2251,6 +2260,19 @@ function isTeamAcct(uid){
     if(DATA.users[i].id===uid) return DATA.users[i].type==='팀';
   return false;
 }
+/* 참조 증빙의 원본 정보를 찾는다 */
+function refSource(refId){
+  for(var i=0;i<DATA.evidence.length;i++){
+    if(String(DATA.evidence[i].id)===String(refId)) return DATA.evidence[i];
+  }
+  return null;
+}
+function euOf(euId){
+  for(var i=0;i<DATA.evalUnits.length;i++){
+    if(String(DATA.evalUnits[i].id)===String(euId)) return DATA.evalUnits[i];
+  }
+  return {};
+}
 function myItems(uid){
   var euMap={}; DATA.evalUnits.forEach(function(r){ euMap[r.id]=r; });
   var byDef={};
@@ -2261,8 +2283,15 @@ function myItems(uid){
   if(me && String(me.id)===String(uid) && !isTeamAcct(uid)){
     myTeamIds().forEach(function(t){ keys[String(t)]=1; });
   }
+  /* 참조 증빙은 담당자 목록에 따로 띄우지 않는다. 원본 카드에 "함께 사용" 표시만 한다 */
+  var usedBy={};
+  DATA.evidence.forEach(function(d){
+    if(d.status!=='사용' || !d.refId) return;
+    var eu=euMap[d.euId]||{};
+    (usedBy[d.refId]=usedBy[d.refId]||[]).push({euId:d.euId, control:eu.control||'', defId:d.id});
+  });
   return DATA.evidence
-    .filter(function(d){ return d.status==='사용' && keys[String(d.ownerId)]; })
+    .filter(function(d){ return d.status==='사용' && !d.refId && keys[String(d.ownerId)]; })
     .map(function(d){
       var eu=euMap[d.euId]||{};
       return {
@@ -2272,7 +2301,7 @@ function myItems(uid){
         exUrl:d.exUrl||'', exText:d.exText||'', exDesc:d.exDesc||'',
         rangeLabel:d.rangeLabel||'', rangeType:d.rangeType||'',
         rangeSplit:!!d.rangeSplit, rangeParts:d.rangeParts||[], hostNote:d.hostNote||'',
-        ownerId:d.ownerId, team:isTeamAcct(d.ownerId),
+        ownerId:d.ownerId, team:isTeamAcct(d.ownerId), usedBy:usedBy[d.id]||[],
         files:(byDef[d.id]||[]).slice().sort(function(x,y){ return x.at<y.at?-1:1; })
       };
     })
@@ -2290,8 +2319,10 @@ function myGroups(uid){
   });
   return order.map(function(k){
     var x=g[k];
-    x.done=x.items.filter(function(i){ return itemDone(i); }).length;
-    x.total=x.items.length;
+    var real=x.items.filter(function(i){ return !i.refId; });
+    x.done=real.filter(function(i){ return itemDone(i); }).length;
+    x.total=real.length;
+    x.refCnt=x.items.length-real.length;
     return x;
   });
 }
@@ -2336,6 +2367,7 @@ function partFiles(it, ids){
   return it.files.filter(function(f){ return String(f.infra||'')===String(ids); });
 }
 function itemDone(it){
+  if(it.refId) return it.files.length>0;
   if(!it.rangeSplit || !it.rangeParts.length) return it.files.length>0;
   for(var i=0;i<it.rangeParts.length;i++){
     if(!partFiles(it, it.rangeParts[i].ids).length) return false;
@@ -2396,11 +2428,43 @@ function drawUp(){
        '<span class="nm">'+esc(g.target||g.euId)+'</span>'+
        '<span class="id">'+esc(g.euId)+' · '+esc(g.control)+'</span>'+
        (g.team?'<span class="tag" style="background:#EDF4FB;color:#176BCE">팀 공동</span>':'')+
+       (g.refCnt?'<span class="tag" style="background:#EDF4FB;color:#176BCE">참조 '+g.refCnt+'</span>':'')+
        '<span class="st"><span class="dots">'+dots+'</span>'+
        '<span class="ct '+(full?'g':'w')+'">'+g.done+' / '+g.total+'</span></span></div>'+
        '<div class="grp-b'+(open?' on':'')+'">';
     g.items.forEach(function(it){
       var i=idx++;
+      /* 참조 증빙 — 제출 칸 없이 원본 파일만 보여 준다 */
+      if(it.refId){
+        var src=refSource(it.refId);
+        var seu=src?euOf(src.euId):null;
+        var sctl=seu?(seu.control||''):'';
+        var sdone=it.files.length>0;
+        h+='<div class="up ref" id="up'+i+'">'+
+           '<div class="t">'+esc(it.seq)+'. '+esc(it.type)+
+           '<span class="ref-b">참조</span>'+
+           (sdone?'<span class="done-b">제출 완료 '+it.files.length+'건</span>'
+                 :'<span class="todo-b">원본 미제출</span>')+'</div>'+
+           '<div class="m">'+esc(it.desc)+'</div>'+
+           '<div class="refbox">'+
+           '<b>'+(sctl?esc(sctl)+' 통제의 증빙을 함께 사용합니다':'다른 증빙을 참조합니다')+'</b>'+
+           '<span class="src">'+
+           (src?esc(src.euId)+' · '+esc(String(src.type).substring(0,50)):esc(it.refId))+
+           '</span>'+
+           '<span class="src">'+(sdone
+             ? '원본이 제출되어 이 증빙도 충족되었습니다. 따로 제출하실 필요가 없습니다.'
+             : '원본이 제출되면 자동으로 충족됩니다. 따로 제출하실 필요가 없습니다.')+
+           '</span></div>';
+        it.files.forEach(function(f){
+          h+='<div class="fl"><a href="'+esc(f.url)+'" target="_blank">'+esc(f.name)+'</a>'+
+             '<span style="color:#9DA6AB">'+Math.round((f.size||0)/1024)+'KB</span>'+
+             '<span class="by">'+esc(userName(f.by)||'-')+'</span>'+
+             '<span style="color:#50646E">'+esc(f.at)+' 제출</span></div>';
+        });
+        h+='</div>';
+        return;
+      }
+
       var has=itemDone(it);
       var part=it.rangeSplit && it.rangeParts.length;
       var pc=itemDoneCnt(it), pn=part?it.rangeParts.length:1;
@@ -2411,6 +2475,10 @@ function drawUp(){
          (has?'<span class="done-b">제출 완료'+(part?' '+pn+'구간':' '+it.files.length+'건')+'</span>'
              :'<span class="todo-b">'+(part&&pc?'부분 제출 '+pc+' / '+pn:'미제출')+'</span>')+'</div>'+
          '<div class="m">'+esc(it.desc)+'</div>'+
+         (it.usedBy.length?'<div class="m shared">🔗 한 번 제출하면 <b>'+
+           it.usedBy.map(function(u){ return esc(u.control||u.euId); })
+             .filter(function(v,k,a){ return a.indexOf(v)===k; }).join(', ')+
+           '</b> 통제 증빙으로도 함께 사용됩니다</div>':'')+
          (it.rangeLabel?'<div class="m rng">조회 기간 : <b>'+esc(it.rangeLabel)+'</b></div>':'')+
          (it.hostNote?'<div class="m" style="color:#5A6E78">대상 서버 : '+esc(it.hostNote)+
            ' <span style="color:#176BCE">— 구간을 나누지 않도록 지정된 증빙입니다</span></div>':'')+
@@ -2664,7 +2732,8 @@ function viewCs(){
   var users={}; DATA.users.forEach(function(u){ users[u.id]=u; });
   var euMap={}; DATA.evalUnits.forEach(function(r){ euMap[r.id]=r; });
   var up={}; DATA.files.forEach(function(f){ up[f.defId]=(up[f.defId]||0)+1; });
-  var defs=DATA.evidence.filter(function(d){ return d.status==='사용'; });
+  /* 참조 증빙은 원본 한 건만 세므로 집계에서 제외한다 */
+  var defs=DATA.evidence.filter(function(d){ return d.status==='사용' && !d.refId; });
   var byUser={}, byEu={}, rows=[];
   defs.forEach(function(d){
     var done=!!up[d.id], uid=String(d.ownerId||'(미지정)'), eu=euMap[d.euId]||{};
