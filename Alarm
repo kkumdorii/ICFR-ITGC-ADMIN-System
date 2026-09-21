@@ -1,0 +1,391 @@
+/**
+ * Alarm.gs — 주기 증빙 작성 알람
+ *
+ * 분기·월·반기·연 단위로 작성해야 하는 증빙을 담당자가 잊지 않도록,
+ * 주기 종료일이 지나면 자동으로 작성 요청 메일을 보낸다.
+ *
+ * 평가 사이클이나 기수 잠금과 무관하게 매일 한 번 확인한다.
+ */
+
+var ALARM_FN = 'runPeriodicAlarm';
+
+function _p2(n) { return ('0' + n).slice(-2); }
+function _ymd(d) { return d.getFullYear() + '-' + _p2(d.getMonth() + 1) + '-' + _p2(d.getDate()); }
+
+/** 주기별 종료월. 해당 월 말일이 주기 종료일 */
+function _cycleMonths(kind) {
+  if (kind === '월') return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  if (kind === '분기') return [3, 6, 9, 12];
+  if (kind === '반기') return [6, 12];
+  if (kind === '연') return [12];
+  return [];
+}
+
+/** 주기 라벨. 중복 발송 방지 키로도 쓴다 */
+function _cycleLabel(kind, y, m) {
+  if (kind === '월') return y + 'M' + _p2(m);
+  if (kind === '분기') return y + 'Q' + (m / 3);
+  if (kind === '반기') return y + 'H' + (m === 6 ? 1 : 2);
+  return String(y);
+}
+
+/**
+ * 기준일로부터 과거 24개월 안에서, 발송일이 오늘인 주기를 찾는다.
+ * @return {Object|null} {label, endDate, sendDate}
+ */
+function _dueCycle(kind, delay, today) {
+  var months = _cycleMonths(kind);
+  if (!months.length) return null;
+  var d = delay > 0 ? delay : 1;
+  var now = today ? new Date(today + 'T00:00:00') : new Date();
+  for (var back = 0; back <= 24; back++) {
+    var ref = new Date(now.getFullYear(), now.getMonth() - back, 1);
+    var y = ref.getFullYear(), m = ref.getMonth() + 1;
+    if (months.indexOf(m) < 0) continue;
+    var end = new Date(y, m, 0);                    /* 해당 월 말일 */
+    var send = new Date(y, m - 1, end.getDate() + d);
+    if (_ymd(send) === _ymd(now)) {
+      return { label: _cycleLabel(kind, y, m), endDate: _ymd(end), sendDate: _ymd(send) };
+    }
+  }
+  return null;
+}
+
+/** 알람이 설정된 증빙 목록과 다음 발송 예정일 */
+function getAlarmList() {
+  try {
+    var users = {};
+    getRows('M_사용자').forEach(function (u) { users[u['사용자ID']] = u; });
+    var euMap = {};
+    getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+
+    var sent = {};
+    getRows('T_메일발송').forEach(function (m) {
+      var id = String(m['발송ID'] || '');
+      if (id.indexOf('ALM-') === 0) sent[id] = m['발송일시'] || m['예약일시'] || '';
+    });
+
+    var today = new Date();
+    var rows = [];
+    getRows('T_증빙정의').forEach(function (d) {
+      if (String(d['상태']) !== '사용') return;
+      if (String(d['알람여부']).trim().toUpperCase() !== 'Y') return;
+      var kind = String(d['알람주기'] || '').trim();
+      var delay = Number(d['알람지연일'] || 1) || 1;
+      var eu = euMap[String(d['평가단위ID'])] || {};
+      /* 알람대상자가 지정되어 있으면 그 사람에게, 없으면 담당자에게 보낸다 */
+      var aid = String(d['알람대상자ID'] || '').trim() || String(d['담당자ID'] || '');
+      var u = users[aid];
+      var owner = users[String(d['담당자ID'] || '')];
+
+      /* 다음 발송 예정일 */
+      var months = _cycleMonths(kind), next = '', label = '';
+      for (var i = 0; i <= 24; i++) {
+        var ref = new Date(today.getFullYear(), today.getMonth() + i, 1);
+        var y = ref.getFullYear(), m = ref.getMonth() + 1;
+        if (months.indexOf(m) < 0) continue;
+        var end = new Date(y, m, 0);
+        var send = new Date(y, m - 1, end.getDate() + delay);
+        if (_ymd(send) >= _ymd(today)) { next = _ymd(send); label = _cycleLabel(kind, y, m); break; }
+      }
+      var key = 'ALM-' + d['정의ID'] + '-' + label;
+      rows.push({
+        defId: d['정의ID'], euId: d['평가단위ID'], seq: d['증빙순번'],
+        type: d['증빙유형'], target: eu['대상명'] || eu['평가단위ID'] || '',
+        control: eu['통제코드'] || '',
+        kind: kind, delay: delay, next: next, label: label,
+        alarmId: aid, alarm: u ? u['성명'] : aid,
+        alarmDept: u ? u['소속부서'] : '', email: u ? u['이메일'] : '',
+        ownerId: d['담당자ID'], owner: owner ? owner['성명'] : String(d['담당자ID'] || ''),
+        ownerDept: owner ? owner['소속부서'] : '',
+        split: String(aid) !== String(d['담당자ID'] || ''),
+        sentAt: sent[key] || '',
+        warn: !kind ? '알람주기 없음' : (!u ? '알람 대상 미지정' : (!u['이메일'] ? '이메일 없음' : ''))
+      });
+    });
+    rows.sort(function (a, b) { return String(a.next) < String(b.next) ? -1 : 1; });
+
+    /* 트리거 상태 */
+    var on = false, at = '';
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      if (t.getHandlerFunction() === ALARM_FN) { on = true; }
+    });
+    return {
+      ok: true, rows: rows, triggerOn: on, today: _ymd(today),
+      mailEnabled: cfgOpt('MAIL_ENABLED', 'N'), appMode: cfgOpt('APP_MODE', '운영'),
+      adminEmail: cfgOpt('ADMIN_EMAIL')
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 자동 발송 트리거 켜기·끄기 */
+function setAlarmTrigger(on) {
+  try {
+    var me = currentUser();
+    if (!me || me['역할'] !== '관리자') throw new Error('관리자만 설정할 수 있습니다');
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      if (t.getHandlerFunction() === ALARM_FN) ScriptApp.deleteTrigger(t);
+    });
+    if (on) {
+      ScriptApp.newTrigger(ALARM_FN).timeBased().atHour(9).everyDays(1).create();
+    }
+    return { ok: true, on: !!on };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * 오늘 보낼 알람을 찾아 담당자별로 한 통씩 보낸다.
+ * @param {string} force 특정 정의ID만 강제 발송 (수동 실행용)
+ */
+function runPeriodicAlarm(force) {
+  var manual = typeof force === 'string' && force;
+  try {
+    var enabled = String(cfgOpt('MAIL_ENABLED', 'N')).toUpperCase() === 'Y';
+    var test = String(cfgOpt('APP_MODE', '운영')) === '테스트';
+    var admin = cfgOpt('ADMIN_EMAIL');
+    var url = String(cfgOpt('WEBAPP_URL')).trim();
+    if (url) url += (url.indexOf('?') >= 0 ? '&' : '?') + 'v=up';
+    var contact = cfgOpt('MAIL_CONTACT');
+
+    var users = {};
+    getRows('M_사용자').forEach(function (u) { users[u['사용자ID']] = u; });
+    var euMap = {};
+    getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+    var done = {};
+    getRows('T_메일발송').forEach(function (m) {
+      var id = String(m['발송ID'] || '');
+      if (id.indexOf('ALM-') === 0) done[id] = 1;
+    });
+
+    var today = _ymd(new Date());
+    var byOwner = {};
+    getRows('T_증빙정의').forEach(function (d) {
+      if (String(d['상태']) !== '사용') return;
+      if (String(d['알람여부']).trim().toUpperCase() !== 'Y') return;
+      if (manual && String(d['정의ID']) !== force) return;
+      var kind = String(d['알람주기'] || '').trim();
+      if (!kind) return;
+      var delay = Number(d['알람지연일'] || 1) || 1;
+
+      var cyc = _dueCycle(kind, delay, null);
+      if (!cyc) {
+        if (!manual) return;
+        /* 수동 발송은 가장 최근에 끝난 주기를 대상으로 한다 */
+        var months = _cycleMonths(kind), now = new Date();
+        for (var b = 0; b <= 24 && !cyc; b++) {
+          var ref = new Date(now.getFullYear(), now.getMonth() - b, 1);
+          var y = ref.getFullYear(), m = ref.getMonth() + 1;
+          if (months.indexOf(m) < 0) continue;
+          var end = new Date(y, m, 0);
+          if (_ymd(end) < today) {
+            cyc = { label: _cycleLabel(kind, y, m), endDate: _ymd(end), sendDate: today };
+          }
+        }
+        if (!cyc) return;
+      }
+      var key = 'ALM-' + d['정의ID'] + '-' + cyc.label;
+      if (done[key] && !manual) return;
+
+      var uid = String(d['알람대상자ID'] || '').trim() || String(d['담당자ID'] || '');
+      var u = users[uid];
+      if (!u || !u['이메일']) return;
+      var ow = users[String(d['담당자ID'] || '')];
+      var eu = euMap[String(d['평가단위ID'])] || {};
+      if (!byOwner[uid]) byOwner[uid] = { user: u, items: [] };
+      byOwner[uid].items.push({
+        key: key, defId: d['정의ID'], type: d['증빙유형'],
+        target: eu['대상명'] || d['평가단위ID'], control: eu['통제코드'] || '',
+        euId: d['평가단위ID'], kind: kind, cycle: cyc,
+        owner: (ow && String(uid) !== String(d['담당자ID'] || '')) ? ow['성명'] : '',
+        ownerDept: (ow && String(uid) !== String(d['담당자ID'] || '')) ? ow['소속부서'] : ''
+      });
+    });
+
+    var sent = 0, fail = 0;
+    Object.keys(byOwner).forEach(function (uid) {
+      var o = byOwner[uid], u = o.user;
+      var cyc = o.items[0].cycle;
+      var subject = cfgOpt('MAIL_SUBJECT_PREFIX', '[ITGC]') + ' ' + cyc.label +
+        ' 주기 증빙 작성 요청 (' + o.items.length + '건)';
+      var status = '발송완료', err = '', to = u['이메일'];
+      try {
+        var html = _alarmBody(u, o.items, cyc, url, contact);
+        if (!enabled) { status = '미발송(테스트)'; }
+        else {
+          to = test ? admin : u['이메일'];
+          MailApp.sendEmail({
+            to: to, cc: test ? '' : (_ccList(u['소속부서'], u['이메일']).list || []).join(','),
+            subject: (test ? '[테스트] ' : '') + subject,
+            htmlBody: html, name: cfgOpt('MAIL_SENDER_NAME', '리스크관리팀')
+          });
+        }
+        sent++;
+      } catch (e) {
+        status = '발송실패'; err = e.message; fail++;
+      }
+      o.items.forEach(function (it) {
+        try {
+          appendRow('T_메일발송', {
+            '발송ID': it.key, '평가기수': cfgOpt('CURRENT_PERIOD', ''),
+            '발송유형': '작성알람', '발송구분': manual ? '즉시' : '예약',
+            '예약일시': '', '발송일시': now_(),
+            '수신자ID': uid, '수신자명': u['성명'], '소속부서': u['소속부서'],
+            '수신이메일': to, '대상증빙': o.items.length, '미제출건수': '',
+            '제목': subject, '상태': status, '오류메시지': err,
+            '트리거ID': '', '참조': '', '요청자ID': manual ? '수동' : '자동'
+          });
+        } catch (e) { }
+      });
+    });
+    return { ok: true, owners: Object.keys(byOwner).length, sent: sent, failed: fail, date: today };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 알람 메일 미리보기. 실제 발송과 같은 본문을 만든다 */
+function previewAlarm(defId) {
+  try {
+    var d = findRow('T_증빙정의', '정의ID', defId);
+    if (!d) throw new Error('증빙정의를 찾을 수 없습니다: ' + defId);
+    var kind = String(d['알람주기'] || '').trim();
+    if (!kind) throw new Error('알람주기가 지정되어 있지 않습니다');
+    var delay = Number(d['알람지연일'] || 1) || 1;
+
+    var users = {};
+    getRows('M_사용자').forEach(function (x) { users[x['사용자ID']] = x; });
+    var aid = String(d['알람대상자ID'] || '').trim() || String(d['담당자ID'] || '');
+    var u = users[aid];
+    if (!u) throw new Error('알람 대상자를 M_사용자에서 찾을 수 없습니다: ' + aid);
+    var ow = users[String(d['담당자ID'] || '')];
+    var split = String(aid) !== String(d['담당자ID'] || '');
+
+    /* 다음 발송 주기를 기준으로 미리 만든다 */
+    var months = _cycleMonths(kind), now = new Date(), cyc = null;
+    for (var i = 0; i <= 24 && !cyc; i++) {
+      var ref = new Date(now.getFullYear(), now.getMonth() + i, 1);
+      var y = ref.getFullYear(), m = ref.getMonth() + 1;
+      if (months.indexOf(m) < 0) continue;
+      var end = new Date(y, m, 0);
+      var send = new Date(y, m - 1, end.getDate() + delay);
+      if (_ymd(send) >= _ymd(now)) {
+        cyc = { label: _cycleLabel(kind, y, m), endDate: _ymd(end), sendDate: _ymd(send) };
+      }
+    }
+    if (!cyc) throw new Error('발송 주기를 계산할 수 없습니다');
+
+    var eu = findRow('T_평가단위', '평가단위ID', d['평가단위ID']) || {};
+    var items = [{
+      defId: d['정의ID'], type: d['증빙유형'],
+      target: eu['대상명'] || d['평가단위ID'], control: eu['통제코드'] || '',
+      euId: d['평가단위ID'], kind: kind, cycle: cyc,
+      owner: split && ow ? ow['성명'] : '',
+      ownerDept: split && ow ? ow['소속부서'] : ''
+    }];
+
+    var url = String(cfgOpt('WEBAPP_URL')).trim();
+    if (url) url += (url.indexOf('?') >= 0 ? '&' : '?') + 'v=up';
+    var cc = _ccList(u['소속부서'], u['이메일']);
+    var test = String(cfgOpt('APP_MODE', '운영')) === '테스트';
+
+    return {
+      ok: true,
+      subject: cfgOpt('MAIL_SUBJECT_PREFIX', '[ITGC]') + ' ' + cyc.label +
+               ' 주기 증빙 작성 요청 (1건)',
+      html: _alarmBody(u, items, cyc, url, cfgOpt('MAIL_CONTACT')),
+      to: u['이메일'], name: u['성명'], dept: u['소속부서'],
+      cc: test ? [] : cc.list, ccInfo: { leaderCount: cc.leaderCount, dept: cc.dept, leaders: cc.leaders },
+      cycle: cyc, split: split,
+      owner: split && ow ? ow['성명'] : '', ownerDept: split && ow ? ow['소속부서'] : ''
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 작성알람 발송 이력 */
+function getAlarmHistory() {
+  try {
+    var defs = {};
+    getRows('T_증빙정의').forEach(function (d) { defs[String(d['정의ID'])] = d; });
+    var euMap = {};
+    getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+
+    var rows = getRows('T_메일발송').filter(function (m) {
+      return String(m['발송유형']) === '작성알람' ||
+             String(m['발송ID'] || '').indexOf('ALM-') === 0;
+    }).map(function (m) {
+      var id = String(m['발송ID'] || '');
+      var parts = id.replace(/^ALM-/, '').split('-');
+      var cycle = parts.length ? parts[parts.length - 1] : '';
+      var defId = parts.slice(0, -1).join('-');
+      var d = defs[defId] || {};
+      var eu = euMap[String(d['평가단위ID'] || '')] || {};
+      return {
+        id: id, defId: defId, cycle: cycle,
+        target: eu['대상명'] || d['평가단위ID'] || '', control: eu['통제코드'] || '',
+        type: d['증빙유형'] || '',
+        at: m['발송일시'], mode: m['발송구분'], by: m['요청자ID'],
+        to: m['수신이메일'], name: m['수신자명'], dept: m['소속부서'],
+        subject: m['제목'], status: m['상태'], error: m['오류메시지'] || '',
+        cc: m['참조'] || ''
+      };
+    });
+    rows.sort(function (a, b) { return String(b.at) < String(a.at) ? -1 : 1; });
+    return { ok: true, rows: rows };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function _alarmBody(u, items, cyc, url, contact) {
+  var B = '#2482C8', D = '#203864', G = '#5A6E78', L = '#DCE6F0';
+  var h = '<div style="font-family:\'맑은 고딕\',Malgun Gothic,sans-serif;background:#F3F7FB;padding:24px 0">' +
+    '<div style="max-width:660px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;' +
+    'border:1px solid ' + L + '">';
+  h += '<div style="background:' + D + ';padding:24px 28px">' +
+    '<div style="color:#A9C4E0;font-size:12px;margin-bottom:9px">다우기술 리스크관리팀</div>' +
+    '<span style="display:inline-block;background:' + B + ';color:#fff;font-size:11.5px;' +
+    'padding:4px 11px;border-radius:20px">내부회계관리제도</span>' +
+    '<div style="color:#fff;font-size:19px;font-weight:bold;line-height:1.45;margin-top:13px">' +
+    cyc.label + ' 주기 증빙 작성을 요청드립니다</div></div>';
+  h += '<div style="padding:24px 28px">';
+  h += '<div style="font-size:14px;line-height:1.9;color:#2B323D">안녕하세요, ' +
+    _esc(u['성명']) + '님.<br>' + cyc.endDate + ' 로 주기가 종료되어 아래 증빙 작성을 요청드립니다.</div>';
+  h += '<div style="background:#F3F7FB;border-radius:10px;padding:14px 17px;margin:16px 0;' +
+    'font-size:13px;line-height:1.9"><b>대상 주기</b> ' + cyc.label +
+    ' (종료 ' + cyc.endDate + ')<br><b>대상 증빙</b> ' + items.length + '건</div>';
+  h += '<div style="border:1px solid ' + L + ';border-radius:10px;overflow:hidden">';
+  items.forEach(function (it, i) {
+    h += '<div style="' + (i ? 'border-top:1px solid ' + L + ';' : '') + 'padding:12px 15px">' +
+      '<div style="font-size:13.5px;font-weight:bold;color:' + D + '">' + _esc(it.target) + '</div>' +
+      '<div style="font-size:11px;color:' + G + ';margin:2px 0 5px">' +
+      _esc(it.euId) + ' · ' + _esc(it.control) + '</div>' +
+      '<div style="font-size:13px;color:#2B323D">' + _esc(it.type) + '</div></div>';
+  });
+  h += '</div>';
+  /* 작성자와 제출자가 다르면 전달 대상을 안내하고 제출 버튼은 넣지 않는다 */
+  var hand = null;
+  items.forEach(function (it) { if (it.owner) hand = it; });
+  if (hand) {
+    h += '<div style="background:#FBF4E3;border:1px solid #E8D9A8;border-radius:10px;' +
+      'padding:14px 17px;margin:18px 0 6px;font-size:13px;color:#8A6508;line-height:1.85">' +
+      '작성이 완료되면 <b>' + _esc(hand.ownerDept) + ' ' + _esc(hand.owner) + '</b> 님께 ' +
+      '전달해 주십시오. 관리자시스템 제출은 해당 담당자가 진행합니다.</div>';
+  } else if (url) {
+    h += '<div style="text-align:center;margin:22px 0 6px">' +
+      '<a href="' + _esc(url) + '" style="display:inline-block;background:' + B +
+      ';color:#fff;text-decoration:none;font-size:14px;font-weight:bold;' +
+      'padding:12px 32px;border-radius:8px">증빙 제출하러 가기 \u2197</a></div>';
+  }
+  h += '<div style="border-top:1px solid ' + L + ';margin-top:20px;padding-top:14px;' +
+    'font-size:11.5px;color:' + G + ';line-height:1.8">' +
+    '주기 증빙은 작성 누락 시 해당 기간 통제가 미비점으로 평가될 수 있습니다.<br>' +
+    (contact ? '문의 : ' + _esc(contact) : '') + '</div>';
+  h += '</div></div></div>';
+  return h;
+}
