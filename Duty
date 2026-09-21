@@ -1,0 +1,362 @@
+/**
+ * Duty.gs — 개발·운영 분리원칙 검토
+ *
+ * M_업무분장(시스템 × 역할 × 담당자)을 읽어
+ *   1) 매트릭스로 보여주고
+ *   2) 개발자와 운영 역할을 겸직하는 사람을 자동 탐지하고
+ *   3) 검토 결과를 T_분장검토에 남기고
+ *   4) 조서에 붙일 수 있는 엑셀로 내려준다
+ */
+
+var DUTY_ROLES = ['개발자', '배포자', 'DBA', '배치잡', 'OS-SuperUser', 'Admin-SuperUser'];
+var DUTY_OPS = ['배포자', 'DBA', '배치잡', 'OS-SuperUser', 'Admin-SuperUser'];
+
+function _dutyRows(baseDate) {
+  var rows = getRows('M_업무분장').filter(function (r) {
+    return String(r['상태']).trim() !== '삭제' &&
+           (!baseDate || String(r['기준일']).substring(0, 10) === String(baseDate));
+  });
+  return rows;
+}
+
+/** 기준일 목록. 최신이 앞 */
+function _dutyBases() {
+  var s = {};
+  getRows('M_업무분장').forEach(function (r) {
+    var d = String(r['기준일'] || '').substring(0, 10);
+    if (d) s[d] = 1;
+  });
+  return Object.keys(s).sort().reverse();
+}
+
+/**
+ * 매트릭스 + 위반 탐지
+ * @param {string} baseDate 비우면 최신 기준일
+ */
+function getDutyMatrix(baseDate) {
+  try {
+    var bases = _dutyBases();
+    var base = baseDate || bases[0] || '';
+    var rows = _dutyRows(base);
+
+    /* 시스템별 개발자 명단 */
+    var devBySys = {};
+    rows.forEach(function (r) {
+      if (r['역할구분'] !== '개발자') return;
+      var k = String(r['시스템ID']);
+      (devBySys[k] = devBySys[k] || {})[String(r['성명']).trim()] = 1;
+    });
+
+    /* 매트릭스 */
+    var sys = {}, order = [];
+    rows.forEach(function (r) {
+      var k = String(r['시스템ID']);
+      if (!sys[k]) {
+        sys[k] = { sysId: k, name: r['대상시스템'] || k, cells: {} };
+        order.push(k);
+      }
+      var role = String(r['역할구분']);
+      if (!sys[k].cells[role]) sys[k].cells[role] = { team: {}, people: [] };
+      if (r['팀명']) sys[k].cells[role].team[String(r['팀명'])] = 1;
+      var name = String(r['성명']).trim();
+      var dup = (role !== '개발자') && !!(devBySys[k] && devBySys[k][name]);
+      sys[k].cells[role].people.push({
+        id: r['분장ID'], name: name, rank: r['직급'] || '',
+        part: r['업무구분'] || '',
+        dup: dup,
+        exc: String(r['예외여부']).trim().toUpperCase() === 'Y',
+        reason: r['예외사유'] || ''
+      });
+    });
+
+    /* 시스템별 분리 검증 — 개발자 명단 ↔ 운영 역할 명단의 교집합 */
+    order.forEach(function (k) {
+      var o = sys[k];
+      var devs = Object.keys(devBySys[k] || {});
+      var ops = {}, axes = [];
+      DUTY_OPS.forEach(function (role) {
+        var c = o.cells[role];
+        var hit = [];
+        if (c) c.people.forEach(function (p) {
+          ops[p.name] = 1;
+          if (devs.indexOf(p.name) >= 0) hit.push({ name: p.name, exc: p.exc, reason: p.reason });
+        });
+        axes.push({ role: role, hit: hit, ok: hit.length === 0,
+                    allExc: hit.length > 0 && hit.every(function (x) {
+                      return x.exc && String(x.reason).trim(); }) });
+      });
+      var opList = Object.keys(ops);
+      var inter = devs.filter(function (n) { return ops[n]; });
+      var interInfo = inter.map(function (n) {
+        var e = null;
+        DUTY_OPS.forEach(function (role) {
+          var c = o.cells[role];
+          if (!c) return;
+          c.people.forEach(function (p) { if (p.name === n && p.exc) e = p.reason; });
+        });
+        return { name: n, exc: !!e, reason: e || '' };
+      });
+      o.check = {
+        devs: devs, ops: opList, inter: interInfo, axes: axes,
+        verdict: inter.length === 0 ? '적정'
+               : (interInfo.every(function (x) { return x.exc; }) ? '예외승인' : '조치필요')
+      };
+    });
+
+    /* 위반 목록 */
+    var viol = [];
+    rows.forEach(function (r) {
+      if (r['역할구분'] === '개발자') return;
+      var k = String(r['시스템ID']);
+      var name = String(r['성명']).trim();
+      if (!(devBySys[k] && devBySys[k][name])) return;
+      var exc = String(r['예외여부']).trim().toUpperCase() === 'Y';
+      viol.push({
+        id: r['분장ID'], sysId: k, sysName: r['대상시스템'] || k,
+        role: r['역할구분'], team: r['팀명'], name: name, rank: r['직급'] || '',
+        part: r['업무구분'] || '', exc: exc, reason: r['예외사유'] || '',
+        row: r._row
+      });
+    });
+
+    var unapp = viol.filter(function (v) { return !v.exc || !String(v.reason).trim(); });
+
+    return {
+      ok: true, base: base, bases: bases, roles: DUTY_ROLES,
+      systems: order.map(function (k) { return sys[k]; }),
+      total: rows.length, viol: viol,
+      counts: { total: rows.length, viol: viol.length,
+                approved: viol.length - unapp.length, unapproved: unapp.length }
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 예외 승인 — 사유를 저장하고 예외여부를 Y로 */
+function approveDutyException(dutyId, reason) {
+  try {
+    assertUnlocked();
+    var me = currentUser();
+    if (!me || (me['역할'] !== '관리자' && me['역할'] !== '검토자')) {
+      throw new Error('관리자 또는 검토자만 예외를 승인할 수 있습니다');
+    }
+    if (!String(reason || '').trim()) throw new Error('예외 사유를 입력하십시오');
+    var r = findRow('M_업무분장', '분장ID', dutyId);
+    if (!r) throw new Error('해당 행을 찾을 수 없습니다: ' + dutyId);
+    updateCell('M_업무분장', r._row, '예외여부', 'Y');
+    updateCell('M_업무분장', r._row, '예외사유', String(reason).trim());
+    return { ok: true, id: dutyId };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 예외 해제 */
+function revokeDutyException(dutyId) {
+  try {
+    assertUnlocked();
+    var me = currentUser();
+    if (!me || (me['역할'] !== '관리자' && me['역할'] !== '검토자')) {
+      throw new Error('관리자 또는 검토자만 변경할 수 있습니다');
+    }
+    var r = findRow('M_업무분장', '분장ID', dutyId);
+    if (!r) throw new Error('해당 행을 찾을 수 없습니다: ' + dutyId);
+    updateCell('M_업무분장', r._row, '예외여부', 'N');
+    updateCell('M_업무분장', r._row, '예외사유', '');
+    return { ok: true, id: dutyId };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 검토 결과 기록 */
+function saveDutyReview(p) {
+  try {
+    assertUnlocked();
+    var me = currentUser();
+    if (!me || (me['역할'] !== '관리자' && me['역할'] !== '검토자')) {
+      throw new Error('관리자 또는 검토자만 검토를 기록할 수 있습니다');
+    }
+    var m = getDutyMatrix(p.base);
+    if (!m.ok) throw new Error(m.error);
+    var concl = m.counts.unapproved > 0 ? '미비점' : '적정';
+    var id = withLock(function () {
+      var nid = nextId('T_분장검토', '검토ID', 'DR-', 6);
+      appendRow('T_분장검토', {
+        '검토ID': nid, '평가기수': cfg('CURRENT_PERIOD'), '기준일': m.base,
+        '검토일시': now_(), '검토자ID': me['사용자ID'], '검토자명': me['성명'],
+        '대상행수': m.counts.total, '위반건수': m.counts.viol,
+        '예외승인건수': m.counts.approved, '미승인위반건수': m.counts.unapproved,
+        '결론': concl, '검토의견': String(p.opinion || '').trim(), '상태': '확정'
+      });
+      return nid;
+    });
+    return { ok: true, id: id, concl: concl, counts: m.counts };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function getDutyReviews() {
+  try {
+    var rows = getRows('T_분장검토').map(function (r) {
+      return {
+        id: r['검토ID'], period: r['평가기수'], base: String(r['기준일']).substring(0, 10),
+        at: r['검토일시'], by: r['검토자명'], total: r['대상행수'],
+        viol: r['위반건수'], approved: r['예외승인건수'], unapproved: r['미승인위반건수'],
+        concl: r['결론'], opinion: r['검토의견']
+      };
+    }).sort(function (a, b) { return String(b.at) < String(a.at) ? -1 : 1; });
+    return { ok: true, rows: rows };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 엑셀 내려받기 ─────────────── */
+
+/**
+ * 매트릭스 · 위반목록 · 검토이력을 담은 xlsx 를 만들어 Drive 에 저장하고 URL 을 돌려준다.
+ * 조서에 그대로 붙일 수 있는 형태다.
+ */
+function exportDutyExcel(baseDate) {
+  var tempId = null;
+  try {
+    var m = getDutyMatrix(baseDate);
+    if (!m.ok) throw new Error(m.error);
+    var period = cfg('CURRENT_PERIOD');
+    var name = '업무분장_분리원칙검토_' + m.base + '_' + period;
+
+    var temp = SpreadsheetApp.create(name);
+    tempId = temp.getId();
+
+    /* 1. 매트릭스 */
+    var sh = temp.getSheets()[0];
+    sh.setName('업무분장 매트릭스');
+    var head = ['대상시스템', '시스템ID'];
+    DUTY_ROLES.forEach(function (r) { head.push(r + ' (팀)'); head.push(r + ' (담당자)'); });
+    var grid = [
+      [name],
+      ['기준일 ' + m.base + ' · 평가기수 ' + period + ' · 생성 ' + now_()],
+      head
+    ];
+    m.systems.forEach(function (s) {
+      var row = [s.name, s.sysId];
+      DUTY_ROLES.forEach(function (role) {
+        var c = s.cells[role];
+        if (!c) { row.push(''); row.push(''); return; }
+        row.push(Object.keys(c.team).join('\n'));
+        row.push(c.people.map(function (p) {
+          return (p.part ? '(' + p.part + ') ' : '') + p.name + (p.rank ? ' ' + p.rank : '') +
+                 (p.dup ? (p.exc ? ' [예외승인]' : ' [겸직]') : '');
+        }).join('\n'));
+      });
+      grid.push(row);
+    });
+    sh.getRange(1, 1, grid.length, head.length).setValues(
+      grid.map(function (r) {
+        var o = r.slice();
+        while (o.length < head.length) o.push('');
+        return o;
+      }));
+    sh.getRange(3, 1, 1, head.length).setFontWeight('bold').setBackground('#DCE6F0');
+    sh.getRange(1, 1).setFontWeight('bold').setFontSize(13);
+    sh.setFrozenRows(3);
+    sh.setFrozenColumns(1);
+
+    /* 2. 위반 목록 */
+    var s2 = temp.insertSheet('겸직 탐지');
+    var h2 = ['분장ID', '대상시스템', '역할구분', '팀명', '성명', '직급', '업무구분',
+              '예외여부', '예외사유', '판정'];
+    var g2 = [['개발·운영 겸직 탐지 결과'],
+              ['전체 ' + m.counts.total + '행 · 겸직 ' + m.counts.viol +
+               '건 · 예외승인 ' + m.counts.approved + '건 · 미승인 ' + m.counts.unapproved + '건'],
+              h2];
+    m.viol.forEach(function (v) {
+      g2.push([v.id, v.sysName, v.role, v.team, v.name, v.rank, v.part,
+               v.exc ? 'Y' : 'N', v.reason,
+               (v.exc && String(v.reason).trim()) ? '예외 승인' : '조치 필요']);
+    });
+    if (!m.viol.length) g2.push(['', '겸직으로 탐지된 건이 없습니다']);
+    s2.getRange(1, 1, g2.length, h2.length).setValues(
+      g2.map(function (r) { var o = r.slice(); while (o.length < h2.length) o.push(''); return o; }));
+    s2.getRange(3, 1, 1, h2.length).setFontWeight('bold').setBackground('#DCE6F0');
+    s2.getRange(1, 1).setFontWeight('bold').setFontSize(13);
+    s2.setFrozenRows(3);
+
+    /* 2-2. 역할축 교차 검증 */
+    var s22 = temp.insertSheet('역할축 교차검증');
+    var h22 = ['대상시스템', '개발자 수', '개발자 명단',
+               '개발자 → 배포자', '개발자 → DBA', '개발자 → 배치잡',
+               '개발자 → OS-SuperUser', '개발자 → Admin-SuperUser', '종합 판정'];
+    var g22 = [['개발자와 운영 역할의 교차 검증'],
+               ['기준일 ' + m.base + ' · 각 축별로 개발자가 해당 역할을 겸하는지 확인한 결과'],
+               h22];
+    m.systems.forEach(function (s) {
+      var ck = s.check || { devs: [], axes: [], verdict: '-' };
+      var row = [s.name, ck.devs.length, ck.devs.join(', ')];
+      ck.axes.forEach(function (a) {
+        row.push(a.ok ? '해당 없음'
+               : (a.allExc ? '예외 승인 : ' + a.hit.map(function (x) { return x.name; }).join(', ')
+                           : '겸직 : ' + a.hit.map(function (x) { return x.name; }).join(', ')));
+      });
+      row.push(ck.verdict);
+      g22.push(row);
+    });
+    s22.getRange(1, 1, g22.length, h22.length).setValues(
+      g22.map(function (r) { var o = r.slice(); while (o.length < h22.length) o.push(''); return o; }));
+    s22.getRange(3, 1, 1, h22.length).setFontWeight('bold').setBackground('#DCE6F0');
+    s22.getRange(1, 1).setFontWeight('bold').setFontSize(13);
+    s22.setFrozenRows(3);
+    s22.setFrozenColumns(1);
+
+    /* 3. 상세 */
+    var s3 = temp.insertSheet('담당자 상세');
+    var h3 = ['분장ID', '기준일', '시스템ID', '대상시스템', '역할구분', '팀명',
+              '성명', '직급', '업무구분', '예외여부', '예외사유'];
+    var g3 = [h3];
+    _dutyRows(m.base).forEach(function (r) {
+      g3.push([r['분장ID'], String(r['기준일']).substring(0, 10), r['시스템ID'],
+               r['대상시스템'], r['역할구분'], r['팀명'], r['성명'], r['직급'],
+               r['업무구분'], r['예외여부'], r['예외사유']]);
+    });
+    s3.getRange(1, 1, g3.length, h3.length).setValues(g3);
+    s3.getRange(1, 1, 1, h3.length).setFontWeight('bold').setBackground('#DCE6F0');
+    s3.setFrozenRows(1);
+
+    /* 4. 검토 이력 */
+    var rv = getDutyReviews();
+    if (rv.ok && rv.rows.length) {
+      var s4 = temp.insertSheet('검토 이력');
+      var h4 = ['검토ID', '평가기수', '기준일', '검토일시', '검토자', '대상행수',
+                '위반', '예외승인', '미승인', '결론', '검토의견'];
+      var g4 = [h4];
+      rv.rows.forEach(function (r) {
+        g4.push([r.id, r.period, r.base, r.at, r.by, r.total,
+                 r.viol, r.approved, r.unapproved, r.concl, r.opinion]);
+      });
+      s4.getRange(1, 1, g4.length, h4.length).setValues(g4);
+      s4.getRange(1, 1, 1, h4.length).setFontWeight('bold').setBackground('#DCE6F0');
+      s4.setFrozenRows(1);
+    }
+
+    SpreadsheetApp.flush();
+    var blob = UrlFetchApp.fetch(
+      'https://docs.google.com/spreadsheets/d/' + tempId + '/export?format=xlsx',
+      { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } }
+    ).getBlob().setName(name + '.xlsx');
+
+    var folder = ensureFolderPath(cfg('FOLDER_WORKPAPER'), [period, '업무분장']);
+    var it = folder.getFilesByName(name + '.xlsx');
+    while (it.hasNext()) it.next().setTrashed(true);
+    var file = folder.createFile(blob);
+
+    return { ok: true, name: file.getName(), url: file.getUrl(),
+             size: file.getSize(), counts: m.counts, base: m.base };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  } finally {
+    if (tempId) { try { DriveApp.getFileById(tempId).setTrashed(true); } catch (e) { } }
+  }
+}
