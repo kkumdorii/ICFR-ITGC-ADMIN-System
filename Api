@@ -1,0 +1,599 @@
+/**
+ * Api.gs — 화면(google.script.run)이 호출하는 조회 함수
+ * 읽기 전용. 등록·수정은 다음 단계에서 추가한다.
+ */
+
+function getBootstrap() {
+  try {
+    var eu = getRows('T_평가단위');
+    var sys = getRows('M_시스템');
+    var inf = getRows('M_인프라');
+    var svc = getRows('M_서비스');
+    var ev = getRows('T_증빙정의');
+    var usr = getRows('M_사용자');
+    var fil = getRows('T_증빙파일');
+    var period = cfg('CURRENT_PERIOD');
+
+    // 평가단위별 증빙 건수 (삭제 상태 제외)
+    var evCnt = {};
+    ev.forEach(function (r) {
+      if (r['상태'] === '삭제') return;
+      var k = String(r['평가단위ID']);
+      evCnt[k] = (evCnt[k] || 0) + 1;
+    });
+
+    return {
+      ok: true,
+      meta: {
+        appName: cfg('APP_NAME'),
+        period: cfg('CURRENT_PERIOD'),
+        periodLabel: _periodLabel(cfg('CURRENT_PERIOD')),
+        locked: String(cfgOpt('PERIOD_LOCKED', 'N')).toUpperCase() === 'Y',
+        lockedAt: cfgOpt('PERIOD_LOCKED_AT'),
+        lockedBy: cfgOpt('PERIOD_LOCKED_BY'),
+        prevPeriod: cfg('PREV_PERIOD'),
+        periodStart: cfg('PERIOD_START'),
+        periodEnd: cfg('PERIOD_END'),
+        dueDate: cfg('EVIDENCE_DUE_DATE'),
+        mode: cfg('APP_MODE'),
+        mailEnabled: cfg('MAIL_ENABLED'),
+        maxMb: Number(cfg('MAX_FILE_SIZE_MB') || 10),
+        user: Session.getActiveUser().getEmail()
+      },
+      counts: {
+        service: svc.length, system: sys.length, infra: inf.length,
+        evalUnit: eu.length, evidence: ev.length, user: usr.length
+      },
+      filters: {
+        control: _uniq(eu.map(function (r) { return r['통제코드']; })),
+        layer: getCodes('대상레이어').map(function (c) { return c.value; }),
+        scope: getCodes('대상범위').map(function (c) { return c.value; }),
+        assetType: getCodes('자산구분').map(function (c) { return c.value; }),
+        zone: getCodes('망구분').map(function (c) { return c.value; }),
+        dept: _uniq(eu.map(function (r) { return r['수행부서']; })),
+        period: getCodes('평가기수')
+      },
+      dashboard: _dashboard(eu, sys, inf, ev, evCnt),
+      evalUnits: eu.map(function (r) { return _euView(r, evCnt); }),
+      evidence: (function () {
+        var euMap = {}, infMap = {};
+        eu.forEach(function (x) { euMap[String(x['평가단위ID'])] = x; });
+        inf.forEach(function (x) { infMap[String(x['인프라ID'])] = x; });
+        var st = String(cfg('PERIOD_START')).substring(0, 10);
+        var en = String(cfg('PERIOD_END')).substring(0, 10);
+        var today = now_().substring(0, 10);
+        return ev.map(function (d) {
+          var v = _evView(d);
+          var rg = _evRange(d, euMap[String(d['평가단위ID'])], infMap, st, en, today);
+          v.rangeType = rg.type; v.rangeLabel = rg.label;
+          v.rangeSplit = !!rg.split; v.rangeParts = rg.parts || [];
+          v.hostNote = rg.hostNote || '';
+          return v;
+        });
+      })(),
+      files: fil.filter(function (f) {
+        return String(f['평가기수']) === period && f['상태'] !== '삭제';
+      }).map(function (f) {
+        return {
+          fileId: f['파일ID'], euId: f['평가단위ID'], defId: f['정의ID'],
+          name: f['파일명'], url: f['DriveURL'], size: f['파일크기'],
+          at: f['업로드일시'], by: f['업로드자ID']
+        };
+      }),
+      users: usr.map(function (r) {
+        return {
+          id: r['사용자ID'], email: r['이메일'], name: r['성명'],
+          dept: r['소속부서'], title: r['직위'], role: r['역할'],
+          type: String(r['구분'] || '개인').trim() || '개인',
+          leader: String(r['팀장여부'] || '').trim().toUpperCase(),
+          sysIds: r['담당시스템ID'], status: r['상태']
+        };
+      }),
+      systems: sys.map(function (r) {
+        return {
+          id: r['시스템ID'], name: r['시스템명'], group: r['시스템군'],
+          serviceId: r['서비스ID'], dept: r['담당부서'],
+          itgc: r['ITGC대상여부'], status: r['상태'], note: r['비고']
+        };
+      }),
+      infra: inf.map(function (r) {
+        return {
+          id: r['인프라ID'], sysId: r['시스템ID'], asset: r['자산구분'],
+          host: r['호스트명'], ip: r['IP주소'], os: r['OS종류'], dbms: r['DBMS종류'],
+          use: r['용도'], zone: r['망구분'], loc: r['위치'],
+          dept: r['관리부서'], status: r['상태'], note: r['비고']
+        };
+      }),
+      services: svc.map(function (r) {
+        return { id: r['서비스ID'], name: r['서비스명'], div: r['사업부문'], status: r['상태'] };
+      })
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function _euView(r, evCnt) {
+  var id = String(r['평가단위ID']);
+  return {
+    id: id, control: r['통제코드'], area: r['영역'],
+    activity: r['통제활동명'], key: r['Key여부'],
+    sysId: r['시스템ID'], scope: r['대상범위'], sysGroup: r['시스템군'],
+    infraId: r['인프라ID'], layer: r['대상 레이어'],
+    dept: r['수행부서'], performer: r['통제수행자'], target: r['대상명'],
+    cycle: r['통제주기'], sampleType: r['표본방식'],
+    sampleSize: r['표본크기'], sampleCount: r['표본건수'],
+    population: r['모집단정의'], status: r['상태'], note: r['비고'],
+    evCount: (evCnt && evCnt[id]) || 0
+  };
+}
+
+/** 기수 코드를 표시명으로 바꾼다. C_코드에 없으면 코드 그대로 */
+function _periodLabel(code) {
+  var out = String(code || '');
+  getCodes('평가기수').forEach(function (c) { if (c.value === code) out = c.label; });
+  return out;
+}
+
+/**
+ * 증빙별 조회 기간을 계산한다.
+ * 평가기간을 고르면 인프라 유효기간과 교집합을 내어 인프라별로 나눠 안내한다.
+ */
+function _evRange(def, eu, infMap, st, en, today) {
+  var t = String(def['조회기간구분'] || '평가기간').trim() || '평가기간';
+  var note = String(def['조회기간비고'] || '').trim();
+
+  if (t === '전체') return { type: t, label: '전체 이력 (기간 제한 없음)', parts: [] };
+  if (t === '직접지정') return { type: t, label: note || '직접 지정', parts: [] };
+  if (t === '종료분기') {
+    /* 분기 종료일이 평가대상기간에 포함되는 분기를 찾는다 */
+    var qs = [], y0 = parseInt(String(st).substring(0, 4), 10);
+    var y1 = parseInt(String(en).substring(0, 4), 10);
+    for (var y = y0; y <= y1; y++) {
+      [['Q1', '-01-01', '-03-31'], ['Q2', '-04-01', '-06-30'],
+       ['Q3', '-07-01', '-09-30'], ['Q4', '-10-01', '-12-31']].forEach(function (q) {
+        var qe = y + q[2];
+        if (qe >= st && qe <= en) qs.push({ name: y + q[0], start: y + q[1], end: qe });
+      });
+    }
+    if (!qs.length) {
+      return { type: t, label: '평가대상기간에 종료되는 분기가 없습니다', parts: [] };
+    }
+    return {
+      type: t, start: qs[0].start, end: qs[qs.length - 1].end, parts: qs,
+      label: qs.map(function (q) { return q.name; }).join(' · ') +
+             ' (' + qs[0].start + ' ~ ' + qs[qs.length - 1].end + ') · ' +
+             qs.length + '개 분기'
+    };
+  }
+  if (t === '전기초~조회시점') {
+    var y = parseInt(String(st).substring(0, 4), 10) - 1;
+    return { type: t, start: y + '-01-01', end: today,
+             label: y + '-01-01 ~ ' + today + ' (전년 1월 1일부터 조회하는 날까지)', parts: [] };
+  }
+
+  /* 평가기간 — 인프라 유효기간과 교집합.
+     기본은 나눈다. 서버가 교체되면 계정과 이력이 새로 생기기 때문이다.
+     신서버 기준으로만 받으면 되는 증빙은 증빙정의에서 미분할 로 지정한다. */
+  var mode = String(def['구간분할'] || '자동').trim() || '자동';
+  var splitable = (mode !== '미분할');
+  var segs = {}, order = [];
+  var ids = eu ? splitIds(eu['인프라ID']) : [];
+  ids.forEach(function (i) {
+    var f = infMap[i];
+    if (!f) return;
+    var fs = String(f['적용시작일'] || '').substring(0, 10);
+    var fe = String(f['적용종료일'] || '').substring(0, 10);
+    var a = (fs && fs > st) ? fs : st;
+    var b = (fe && fe < en && fe !== '9999-12-31') ? fe : en;
+    if (a > b) return;                       /* 평가기간과 겹치지 않음 */
+    var k = a + '~' + b;
+    if (!segs[k]) { segs[k] = { start: a, end: b, ids: [], hosts: [] }; order.push(k); }
+    segs[k].ids.push(i);
+    segs[k].hosts.push(f['호스트명'] || i);
+  });
+  order.sort();
+
+  /* 구간이 둘 이상이고 미분할이 아닐 때 나눈다.
+     이중화처럼 기간이 같으면 나누지 않는다 */
+  if (order.length > 1 && splitable) {
+    var parts = order.map(function (k, idx) {
+      var g = segs[k];
+      return {
+        no: idx + 1, start: g.start, end: g.end,
+        ids: g.ids.join(','), hosts: g.hosts.join(' · '),
+        label: g.hosts.join(' · ') + '  ' + g.start + ' ~ ' + g.end
+      };
+    });
+    return {
+      type: t, start: st, end: en, split: true, parts: parts,
+      label: parts.map(function (x) { return x.label; }).join('   |   ')
+    };
+  }
+  if (order.length > 1) {
+    /* 미분할로 지정된 경우. 어느 서버가 언제까지 운영되었는지는 알려 준다 */
+    var info = order.map(function (k) {
+      var g = segs[k];
+      return g.hosts.join(' · ') + ' ' + g.start + ' ~ ' + g.end;
+    }).join(' · ');
+    return {
+      type: t, start: st, end: en, split: false, parts: [],
+      label: st + ' ~ ' + en, hostNote: info
+    };
+  }
+  return { type: t, start: st, end: en, split: false, parts: [], label: st + ' ~ ' + en };
+}
+
+function _evView(r) {
+  return {
+    id: r['정의ID'], euId: r['평가단위ID'], seq: r['증빙순번'],
+    type: r['증빙유형'], desc: r['증빙설명'], required: r['필수여부'],
+    ext: r['허용확장자'], filePattern: r['파일명규칙'],
+    method: r['모집단추출방법'], ownerId: r['담당자ID'], status: r['상태'],
+    exUrl: r['예시파일URL'] || '', exText: r['예시내용'] || '', exDesc: r['예시설명'] || '',
+    rangeType: r['조회기간구분'] || '평가기간'
+  };
+}
+
+function _dashboard(eu, sys, inf, ev, evCnt) {
+  var defined = 0;
+  eu.forEach(function (r) { if (evCnt[String(r['평가단위ID'])]) defined++; });
+  return {
+    byControl: _tally(eu, '통제코드'),
+    byLayer: _tally(eu, '대상 레이어'),
+    byScope: _tally(eu, '대상범위'),
+    byDept: _tally(eu, '수행부서'),
+    bySampleType: _tally(eu, '표본방식'),
+    infraByAsset: _tally(inf, '자산구분'),
+    infraByZone: _tally(inf, '망구분'),
+    infraByUse: _tally(inf, '용도'),
+    sysByGroup: _tally(sys, '시스템군'),
+    evidenceProgress: { defined: defined, total: eu.length }
+  };
+}
+
+function _tally(rows, key) {
+  var m = {};
+  rows.forEach(function (r) {
+    var k = String(r[key] || '(미입력)');
+    m[k] = (m[k] || 0) + 1;
+  });
+  return Object.keys(m).sort().map(function (k) { return { label: k, count: m[k] }; });
+}
+
+function _uniq(arr) {
+  var s = {};
+  arr.forEach(function (v) { if (v) s[String(v)] = 1; });
+  return Object.keys(s).sort();
+}
+
+/** 설정·정합성 점검 */
+/** Drive 폴더 확인만 따로. 느리므로 화면에서 버튼으로 실행한다 */
+function getDriveCheck() {
+  try {
+    var out = [];
+    ['FOLDER_ROOT', 'FOLDER_DB', 'FOLDER_EVIDENCE', 'FOLDER_WORKPAPER', 'FOLDER_CHANGE']
+      .forEach(function (k) {
+        var id = cfg(k);
+        if (!id) return;
+        try {
+          out.push({ level: 'OK', key: k, msg: DriveApp.getFolderById(id).getName() });
+        } catch (e) {
+          out.push({ level: 'ERROR', key: k, msg: '폴더 접근 불가: ' + id });
+        }
+      });
+    return { ok: true, config: out };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function getHealthCheck(withDrive) {
+  try {
+    var out = { ok: true, config: [], integrity: [] };
+
+    getRows('C_설정').forEach(function (r) {
+      if (r['필수'] === 'Y' && String(r['설정값']).trim() === '') {
+        out.config.push({ level: 'ERROR', key: r['설정키'], msg: '필수 설정값이 비어 있습니다' });
+      }
+    });
+
+    if (withDrive) {
+      var d = getDriveCheck();
+      if (d.ok) out.config = out.config.concat(d.config);
+    }
+
+    var svcId = _idSet(getRows('M_서비스'), '서비스ID');
+    var sysId = _idSet(getRows('M_시스템'), '시스템ID');
+    var infId = _idSet(getRows('M_인프라'), '인프라ID');
+    var euId = _idSet(getRows('T_평가단위'), '평가단위ID');
+    var usrId = _idSet(getRows('M_사용자'), '사용자ID');
+
+    getRows('M_시스템').forEach(function (r) {
+      if (r['서비스ID'] && !svcId[r['서비스ID']]) {
+        out.integrity.push({ level: 'ERROR', sheet: 'M_시스템', id: r['시스템ID'],
+          msg: 'M_서비스에 없는 서비스ID: ' + r['서비스ID'] });
+      }
+    });
+
+    getRows('M_인프라').forEach(function (r) {
+      splitIds(r['시스템ID']).forEach(function (s) {
+        if (!sysId[s]) {
+          out.integrity.push({ level: 'ERROR', sheet: 'M_인프라', id: r['인프라ID'],
+            msg: 'M_시스템에 없는 시스템ID: ' + s });
+        }
+      });
+    });
+
+    getRows('M_사용자').forEach(function (r) {
+      splitIds(r['담당시스템ID']).forEach(function (s) {
+        if (!sysId[s]) {
+          out.integrity.push({ level: 'ERROR', sheet: 'M_사용자', id: r['사용자ID'],
+            msg: 'M_시스템에 없는 담당시스템ID: ' + s });
+        }
+      });
+      if (r['역할'] === '담당자' && !r['담당시스템ID']) {
+        out.integrity.push({ level: 'WARN', sheet: 'M_사용자', id: r['사용자ID'],
+          msg: '담당자 역할인데 담당시스템ID가 비어 있습니다' });
+      }
+    });
+
+    getRows('T_평가단위').forEach(function (r) {
+      if (r['시스템ID'] && !sysId[r['시스템ID']]) {
+        out.integrity.push({ level: 'ERROR', sheet: 'T_평가단위', id: r['평가단위ID'],
+          msg: 'M_시스템에 없는 시스템ID: ' + r['시스템ID'] });
+      }
+      splitIds(r['인프라ID']).forEach(function (i) {
+        if (!infId[i]) {
+          out.integrity.push({ level: 'ERROR', sheet: 'T_평가단위', id: r['평가단위ID'],
+            msg: 'M_인프라에 없는 인프라ID: ' + i });
+        }
+      });
+      var layer = r['대상 레이어'];
+      if ((layer === 'DB' || layer === 'TOOL') && !r['인프라ID'] && r['대상범위'] === '개별') {
+        out.integrity.push({ level: 'WARN', sheet: 'T_평가단위', id: r['평가단위ID'],
+          msg: layer + ' 레이어인데 인프라ID가 비어 있습니다' });
+      }
+      if (r['표본방식'] === '전수' && String(r['표본크기']).trim() !== '') {
+        out.integrity.push({ level: 'WARN', sheet: 'T_평가단위', id: r['평가단위ID'],
+          msg: '전수인데 표본크기에 값이 있습니다' });
+      }
+      if (r['표본방식'] === '표본' && String(r['표본크기']).trim() === '') {
+        out.integrity.push({ level: 'WARN', sheet: 'T_평가단위', id: r['평가단위ID'],
+          msg: '표본인데 표본크기가 비어 있습니다' });
+      }
+    });
+
+    var seenEv = {}, seqSeen = {};
+    getRows('T_증빙정의').forEach(function (r) {
+      var id = String(r['정의ID']);
+      if (seenEv[id]) {
+        out.integrity.push({ level: 'ERROR', sheet: 'T_증빙정의', id: id, msg: '정의ID 중복' });
+      }
+      seenEv[id] = 1;
+      if (!euId[String(r['평가단위ID'])]) {
+        out.integrity.push({ level: 'ERROR', sheet: 'T_증빙정의', id: id,
+          msg: 'T_평가단위에 없는 평가단위ID: ' + r['평가단위ID'] });
+      }
+      if (r['담당자ID'] && !usrId[String(r['담당자ID'])]) {
+        out.integrity.push({ level: 'ERROR', sheet: 'T_증빙정의', id: id,
+          msg: 'M_사용자에 없는 담당자ID: ' + r['담당자ID'] });
+      }
+      if (!r['담당자ID']) {
+        out.integrity.push({ level: 'WARN', sheet: 'T_증빙정의', id: id,
+          msg: '담당자ID가 비어 있어 요청 메일을 보낼 수 없습니다' });
+      }
+      var k = r['평가단위ID'] + '#' + r['증빙순번'];
+      if (seqSeen[k]) {
+        out.integrity.push({ level: 'WARN', sheet: 'T_증빙정의', id: id,
+          msg: '같은 평가단위에 증빙순번 중복: ' + r['증빙순번'] });
+      }
+      seqSeen[k] = 1;
+    });
+
+    var seen = {};
+    getRows('T_평가단위').forEach(function (r) {
+      var id = String(r['평가단위ID']);
+      if (seen[id]) {
+        out.integrity.push({ level: 'ERROR', sheet: 'T_평가단위', id: id, msg: '평가단위ID 중복' });
+      }
+      seen[id] = 1;
+      if (id.split('-').length !== 5) {
+        out.integrity.push({ level: 'WARN', sheet: 'T_평가단위', id: id,
+          msg: '평가단위ID가 5세그먼트가 아닙니다' });
+      }
+    });
+
+    out.summary = {
+      error: out.config.concat(out.integrity).filter(function (x) { return x.level === 'ERROR'; }).length,
+      warn: out.integrity.filter(function (x) { return x.level === 'WARN'; }).length
+    };
+    return out;
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 증빙파일만 다시 받는다. 폴더 스캔 후 갱신용 */
+function getFilesOnly() {
+  try {
+    var period = cfg('CURRENT_PERIOD');
+    return {
+      ok: true,
+      files: getRows('T_증빙파일').filter(function (f) {
+        return String(f['평가기수']) === period && f['상태'] !== '삭제';
+      }).map(function (f) {
+        return {
+          fileId: f['파일ID'], euId: f['평가단위ID'], defId: f['정의ID'],
+          name: f['파일명'], url: f['DriveURL'], size: f['파일크기'],
+          at: f['업로드일시'], by: f['업로드자ID']
+        };
+      })
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 기수 잠금 ─────────────── */
+
+/** 잠긴 기수에서 데이터를 바꾸려 할 때 막는다. 서버에서 한 번 더 확인한다 */
+function assertUnlocked() {
+  if (String(cfgOpt('PERIOD_LOCKED', 'N')).toUpperCase() === 'Y') {
+    throw new Error('현 기수는 운영평가 완료로 잠겨 있습니다. 관리자가 잠금을 해제해야 수정할 수 있습니다.');
+  }
+}
+
+function getLockInfo() {
+  try {
+    var locked = String(cfgOpt('PERIOD_LOCKED', 'N')).toUpperCase() === 'Y';
+    var byId = cfgOpt('PERIOD_LOCKED_BY');
+    var u = byId ? findRow('M_사용자', '사용자ID', byId) : null;
+    var hist = getRows('T_기수잠금').map(function (r) {
+      return {
+        id: r['잠금ID'], period: r['평가기수'], act: r['작업구분'],
+        at: r['작업일시'], byId: r['작업자ID'], by: r['작업자명'],
+        reason: r['사유'], files: r['증빙파일건수'],
+        pops: r['모집단건수'], wps: r['조서건수']
+      };
+    }).sort(function (a, b) { return String(b.at) < String(a.at) ? -1 : 1; });
+    return {
+      ok: true, locked: locked, period: cfg('CURRENT_PERIOD'),
+      at: cfgOpt('PERIOD_LOCKED_AT'), byId: byId,
+      by: u ? u['성명'] : byId, history: hist
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * 기수 잠금 / 해제
+ * @param {string} action 잠금 | 해제
+ * @param {string} reason 해제 시 필수
+ */
+function setPeriodLock(action, reason) {
+  try {
+    var me = currentUser();
+    if (!me || me['역할'] !== '관리자') {
+      throw new Error('관리자만 잠금을 변경할 수 있습니다');
+    }
+    var cur = String(cfgOpt('PERIOD_LOCKED', 'N')).toUpperCase() === 'Y';
+    if (action === '잠금' && cur) throw new Error('이미 잠겨 있습니다');
+    if (action === '해제' && !cur) throw new Error('잠겨 있지 않습니다');
+    if (action === '해제' && !String(reason || '').trim()) {
+      throw new Error('해제 사유를 입력하십시오');
+    }
+
+    var period = cfg('CURRENT_PERIOD');
+    var nFiles = getRows('T_증빙파일').filter(function (f) {
+      return String(f['평가기수']) === period && f['상태'] !== '삭제';
+    }).length;
+    var nPop = 0, nWp = 0;
+    try {
+      nPop = getRows('T_모집단').filter(function (r) {
+        return String(r['평가기수']) === period; }).length;
+    } catch (e) { }
+    try {
+      nWp = getRows('T_평가조서').filter(function (r) {
+        return String(r['평가기수']) === period; }).length;
+    } catch (e) { }
+
+    withLock(function () {
+      appendRow('T_기수잠금', {
+        '잠금ID': nextId('T_기수잠금', '잠금ID', 'LK-', 6),
+        '평가기수': period, '작업구분': action, '작업일시': now_(),
+        '작업자ID': me['사용자ID'], '작업자명': me['성명'],
+        '사유': String(reason || '').trim(),
+        '증빙파일건수': nFiles, '모집단건수': nPop, '조서건수': nWp, '비고': ''
+      });
+    });
+
+    _setConfig('PERIOD_LOCKED', action === '잠금' ? 'Y' : 'N');
+    _setConfig('PERIOD_LOCKED_AT', action === '잠금' ? now_() : '');
+    _setConfig('PERIOD_LOCKED_BY', action === '잠금' ? me['사용자ID'] : '');
+    try { _configCache = null; } catch (e) { }
+    delete _memo['C_설정'];
+
+    return { ok: true, action: action, locked: action === '잠금',
+             period: period, at: now_(), by: me['성명'], files: nFiles };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 평가기수 전환 ─────────────── */
+
+function _setConfig(key, value) {
+  var r = findRow('C_설정', '설정키', key);
+  if (!r) throw new Error('설정키를 찾을 수 없습니다: ' + key);
+  updateCell('C_설정', r._row, '설정값', value);
+  try {
+    updateCell('C_설정', r._row, '최종수정일시', now_());
+    var me = currentUser();
+    updateCell('C_설정', r._row, '수정자ID', me ? me['사용자ID'] : currentEmail());
+  } catch (e) { }
+}
+
+/** 전환 전 현재 설정을 돌려준다 */
+function previewPeriod(period) {
+  try {
+    var names = {};
+    getCodes('평가기수').forEach(function (c) { names[c.value] = c.label; });
+    return {
+      ok: true, period: period, label: names[period] || period,
+      curPeriod: cfg('CURRENT_PERIOD'), curStart: cfg('PERIOD_START'),
+      curEnd: cfg('PERIOD_END'), curPrev: cfg('PREV_PERIOD'),
+      curDue: cfg('EVIDENCE_DUE_DATE')
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function _isDate(v) { return /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')); }
+
+/**
+ * 진행 기수를 전환한다. 모든 사용자에게 적용된다.
+ * 기간은 자동 계산하지 않고 입력받는다. 반기·분기·임의 구간을 모두 쓸 수 있어야 하기 때문이다.
+ * @param {Object} p {period, start, end, prev, due}
+ */
+function switchPeriod(p) {
+  try {
+    var me = currentUser();
+    if (!me || me['역할'] !== '관리자') throw new Error('관리자만 기수를 전환할 수 있습니다');
+    if (!p || !String(p.period).trim()) throw new Error('기수를 선택하십시오');
+    if (!_isDate(p.start) || !_isDate(p.end)) {
+      throw new Error('평가대상기간을 yyyy-MM-dd 형식으로 입력하십시오');
+    }
+    if (String(p.start) > String(p.end)) throw new Error('시작일이 종료일보다 늦습니다');
+    if (!_isDate(p.due)) throw new Error('증빙 제출 마감일을 yyyy-MM-dd 형식으로 입력하십시오');
+    if (!String(p.prev).trim()) throw new Error('전기 기수를 선택하십시오');
+    if (String(p.prev) === String(p.period)) throw new Error('전기 기수가 현재 기수와 같습니다');
+
+    var before = cfg('CURRENT_PERIOD');
+    _setConfig('CURRENT_PERIOD', String(p.period).trim());
+    _setConfig('PERIOD_START', p.start);
+    _setConfig('PERIOD_END', p.end);
+    _setConfig('PREV_PERIOD', String(p.prev).trim());
+    _setConfig('EVIDENCE_DUE_DATE', p.due);
+    /* 새 기수는 잠금 없이 시작한다 */
+    _setConfig('PERIOD_LOCKED', 'N');
+    _setConfig('PERIOD_LOCKED_AT', '');
+    _setConfig('PERIOD_LOCKED_BY', '');
+
+    try { _configCache = null; } catch (e) { }
+    delete _memo['C_설정'];
+
+    return { ok: true, before: before, period: p.period,
+             start: p.start, end: p.end, prev: p.prev, due: p.due };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function _idSet(rows, key) {
+  var s = {};
+  rows.forEach(function (r) { if (r[key]) s[String(r[key]).trim()] = 1; });
+  return s;
+}
