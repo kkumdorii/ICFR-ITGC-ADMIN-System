@@ -1,0 +1,144 @@
+/**
+ * Repo.gs — 시트 접근 공용 레이어
+ *
+ * 모든 시트는 1행 시트명 / 2행 설명 / 3행 헤더 / 4행부터 데이터 구조를 따른다.
+ * 컬럼 인덱스를 하드코딩하지 않고 헤더명으로 조회하므로,
+ * 컬럼을 중간에 추가해도 코드가 깨지지 않는다.
+ */
+
+var HEADER_ROW = 3;
+var DATA_ROW = 4;
+var _memo = {};
+
+function _ss() {
+  if (!_memo._ss) _memo._ss = SpreadsheetApp.openById(cfg('SS_DB_ID'));
+  return _memo._ss;
+}
+
+function _norm(v) {
+  if (v instanceof Date) {
+    var tz = cfg('TIMEZONE') || 'Asia/Seoul';
+    /* 시·분·초가 있으면 함께 반환한다. 업로드일시가 날짜로만 잘리는 것을 막는다 */
+    var hasTime = v.getHours() || v.getMinutes() || v.getSeconds();
+    return Utilities.formatDate(v, tz, hasTime ? 'yyyy-MM-dd HH:mm:ss' : 'yyyy-MM-dd');
+  }
+  return v === null || v === undefined ? '' : v;
+}
+
+/** 시트를 객체 배열로 반환 */
+function getRows(name) {
+  if (_memo[name]) return _memo[name];
+  var sh = _ss().getSheetByName(name);
+  if (!sh) throw new Error('시트를 찾을 수 없습니다: ' + name);
+  var last = sh.getLastRow(), lastCol = sh.getLastColumn();
+  if (last < DATA_ROW) { _memo[name] = []; return []; }
+
+  var values = sh.getRange(1, 1, last, lastCol).getValues();
+  var head = values[HEADER_ROW - 1];
+  var rows = [];
+  for (var r = DATA_ROW - 1; r < values.length; r++) {
+    var raw = values[r];
+    if (String(raw[0]).trim() === '') continue;
+    var o = {};
+    for (var c = 0; c < head.length; c++) {
+      var h = String(head[c]).trim();
+      if (h) o[h] = _norm(raw[c]);
+    }
+    o._row = r + 1;
+    rows.push(o);
+  }
+  _memo[name] = rows;
+  return rows;
+}
+
+function findRow(name, key, value) {
+  var rows = getRows(name);
+  for (var i = 0; i < rows.length; i++) {
+    if (String(rows[i][key]) === String(value)) return rows[i];
+  }
+  return null;
+}
+
+function getCodes(group) {
+  return getRows('C_코드')
+    .filter(function (r) { return r['코드그룹'] === group && r['사용여부'] === 'Y'; })
+    .sort(function (a, b) { return (a['정렬순서'] || 0) - (b['정렬순서'] || 0); })
+    .map(function (r) { return { value: r['코드값'], label: r['코드명'] || r['코드값'] }; });
+}
+
+function splitIds(v) {
+  if (!v) return [];
+  return String(v).split(',').map(function (s) { return s.trim(); })
+    .filter(function (s) { return s !== ''; });
+}
+
+/* ─────────────── 쓰기 ─────────────── */
+
+/** 헤더명 기준으로 1행 추가. obj의 키가 헤더명과 같아야 한다 */
+function appendRow(name, obj) {
+  var sh = _ss().getSheetByName(name);
+  if (!sh) throw new Error('시트를 찾을 수 없습니다: ' + name);
+  var head = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0];
+  var row = head.map(function (h) {
+    var k = String(h).trim();
+    return (k && obj[k] !== undefined) ? obj[k] : '';
+  });
+  sh.appendRow(row);
+  delete _memo[name];
+  return row;
+}
+
+/** 특정 행의 한 컬럼만 수정 */
+function updateCell(name, rowNo, colName, value) {
+  var sh = _ss().getSheetByName(name);
+  var head = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0];
+  for (var i = 0; i < head.length; i++) {
+    if (String(head[i]).trim() === colName) {
+      sh.getRange(rowNo, i + 1).setValue(value);
+      delete _memo[name];
+      return true;
+    }
+  }
+  throw new Error('컬럼을 찾을 수 없습니다: ' + colName);
+}
+
+/** PREFIX-000001 형식 다음 번호 발급 */
+function nextId(name, colName, prefix, pad) {
+  var max = 0;
+  getRows(name).forEach(function (r) {
+    var v = String(r[colName] || '');
+    if (v.indexOf(prefix) !== 0) return;
+    var n = parseInt(v.substring(prefix.length), 10);
+    if (!isNaN(n) && n > max) max = n;
+  });
+  var s = String(max + 1);
+  while (s.length < pad) s = '0' + s;
+  return prefix + s;
+}
+
+/** 현재 접속자 이메일. 같은 Workspace 도메인이면 실행계정과 무관하게 반환된다 */
+function currentEmail() {
+  return Session.getActiveUser().getEmail() || '';
+}
+
+/** 현재 접속자의 M_사용자 레코드 */
+function currentUser() {
+  var e = currentEmail();
+  if (!e) return null;
+  return findRow('M_사용자', '이메일', e);
+}
+
+/** 지정 경로의 하위 폴더를 만들거나 찾는다. path는 배열 */
+function ensureFolderPath(rootId, path) {
+  var f = DriveApp.getFolderById(rootId);
+  for (var i = 0; i < path.length; i++) {
+    var name = String(path[i]);
+    var it = f.getFoldersByName(name);
+    f = it.hasNext() ? it.next() : f.createFolder(name);
+  }
+  return f;
+}
+
+function now_() {
+  return Utilities.formatDate(new Date(), cfg('TIMEZONE') || 'Asia/Seoul', 'yyyy-MM-dd HH:mm:ss');
+}
