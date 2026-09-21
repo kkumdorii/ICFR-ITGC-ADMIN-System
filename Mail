@@ -34,6 +34,8 @@ function getMailTargets(kind) {
     var byUser = {};
     getRows('T_증빙정의').forEach(function (d) {
       if (d['상태'] !== '사용') return;
+      /* 다른 통제 증빙을 참조하는 건은 따로 요청하지 않는다 */
+      if (String(d['참조정의ID'] || '').trim()) return;
       var uid = String(d['담당자ID'] || '');
       if (!uid) return;
       var eu = euMap[String(d['평가단위ID'])] || {};
@@ -190,6 +192,7 @@ function buildMail(userId, kind) {
   var groups = {}, order = [];
   getRows('T_증빙정의').forEach(function (d) {
     if (d['상태'] !== '사용' || String(d['담당자ID']) !== String(userId)) return;
+    if (String(d['참조정의ID'] || '').trim()) return;
     var k = String(d['평가단위ID']);
     if (!groups[k]) {
       var eu = euMap[k] || {};
