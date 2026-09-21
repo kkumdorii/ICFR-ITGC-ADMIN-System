@@ -77,7 +77,7 @@ function getBootstrap() {
         return {
           fileId: f['파일ID'], euId: f['평가단위ID'], defId: f['정의ID'],
           name: f['파일명'], url: f['DriveURL'], size: f['파일크기'],
-          at: f['업로드일시'], by: f['업로드자ID']
+          at: f['업로드일시'], by: f['업로드자ID'], infra: f['대상인프라'] || ''
         };
       }),
       users: usr.map(function (r) {
@@ -231,7 +231,8 @@ function _evView(r) {
     ext: r['허용확장자'], filePattern: r['파일명규칙'],
     method: r['모집단추출방법'], ownerId: r['담당자ID'], status: r['상태'],
     exUrl: r['예시파일URL'] || '', exText: r['예시내용'] || '', exDesc: r['예시설명'] || '',
-    rangeType: r['조회기간구분'] || '평가기간'
+    rangeType: r['조회기간구분'] || '평가기간',
+    refId: String(r['참조정의ID'] || '').trim()
   };
 }
 
@@ -389,6 +390,25 @@ function getHealthCheck(withDrive) {
           msg: '같은 평가단위에 증빙순번 중복: ' + r['증빙순번'] });
       }
       seqSeen[k] = 1;
+
+      /* 참조 증빙 검증 */
+      var rid = String(r['참조정의ID'] || '').trim();
+      if (rid) {
+        var src = findRow('T_증빙정의', '정의ID', rid);
+        if (!src) {
+          out.integrity.push({ level: 'ERROR', sheet: 'T_증빙정의', id: id,
+            msg: '참조정의ID가 존재하지 않습니다: ' + rid });
+        } else if (String(src['상태']) !== '사용') {
+          out.integrity.push({ level: 'ERROR', sheet: 'T_증빙정의', id: id,
+            msg: '참조 대상 ' + rid + ' 의 상태가 사용이 아닙니다' });
+        } else if (String(src['참조정의ID'] || '').trim()) {
+          out.integrity.push({ level: 'WARN', sheet: 'T_증빙정의', id: id,
+            msg: '참조 대상 ' + rid + ' 이(가) 또 다른 증빙을 참조합니다. 원본을 직접 지정하십시오' });
+        } else if (String(src['허용확장자']) !== String(r['허용확장자'])) {
+          out.integrity.push({ level: 'WARN', sheet: 'T_증빙정의', id: id,
+            msg: '참조 대상과 허용확장자가 다릅니다. 같은 증빙인지 확인하십시오' });
+        }
+      }
     });
 
     var seen = {};
@@ -426,7 +446,7 @@ function getFilesOnly() {
         return {
           fileId: f['파일ID'], euId: f['평가단위ID'], defId: f['정의ID'],
           name: f['파일명'], url: f['DriveURL'], size: f['파일크기'],
-          at: f['업로드일시'], by: f['업로드자ID']
+          at: f['업로드일시'], by: f['업로드자ID'], infra: f['대상인프라'] || ''
         };
       })
     };
