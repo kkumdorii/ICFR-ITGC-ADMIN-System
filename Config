@@ -1,0 +1,434 @@
+/**
+ * =============================================================
+ *  Config.gs — C_설정 시트 읽기 및 점검
+ *  다우기술 내부회계관리제도 관리자시스템
+ * =============================================================
+ *
+ *  [사용법]
+ *  1. 스프레드시트 → 확장 프로그램 → Apps Script
+ *  2. 이 파일 내용을 붙여넣고 저장
+ *  3. 상단 함수 목록에서 checkConfig 선택 → 실행
+ *  4. 처음 실행 시 권한 승인 창이 뜹니다 (Drive 접근 권한 필요)
+ *  5. 하단 '실행 로그'에 점검 결과가 출력됩니다
+ *
+ *  스프레드시트를 새로고침하면 상단에 [ITGC 관리] 메뉴가 생기고,
+ *  거기서도 실행할 수 있습니다.
+ * =============================================================
+ */
+
+// ---------- 상수 ----------
+var CFG_SHEET_NAME = 'C_설정';
+var CFG_HEADER_ROW = 3;          // 헤더가 있는 행
+var CFG_KEY_COL_NAME = '설정키';
+var CFG_VAL_COL_NAME = '설정값';
+var CFG_REQ_COL_NAME = '필수';
+
+// 폴더 설정키 → 실제로 그 이름이어야 하는 폴더명
+// (ID를 잘못 복사해도 접근은 되므로, 이름까지 대조해야 오입력을 잡습니다)
+var EXPECTED_FOLDER_NAMES = {
+  FOLDER_DB: '00_DB',
+  FOLDER_EVIDENCE: '01_증빙',
+  FOLDER_WORKPAPER: '02_조서',
+  FOLDER_CHANGE: '03_변동관리',
+  FOLDER_REF: '99_참고자료'
+};
+
+// 값이 정해진 목록 안에 있어야 하는 설정키
+var ALLOWED_VALUES = {
+  APP_MODE: ['운영', '테스트'],
+  MAIL_ENABLED: ['Y', 'N'],
+  LOG_ENABLED: ['Y', 'N']
+};
+
+var DATE_KEYS = ['PERIOD_START', 'PERIOD_END', 'EVIDENCE_DUE_DATE'];
+var NUMBER_KEYS = ['REMIND_INTERVAL_DAYS', 'REMIND_MAX_COUNT',
+                   'MAX_FILE_SIZE_MB', 'SESSION_TIMEOUT_MIN'];
+var EMAIL_KEYS = ['ADMIN_EMAIL', 'CC_EMAIL', 'ESCALATE_EMAIL'];
+
+var _configCache = null;   // 실행 1회 안에서만 유지됨
+
+
+// =============================================================
+//  1. 설정 읽기 — 웹앱 전체가 이 함수를 씁니다
+// =============================================================
+
+/**
+ * C_설정 시트를 읽어 { 설정키: 설정값 } 객체로 반환합니다.
+ * 컬럼 위치가 아니라 헤더명으로 찾으므로, 열 순서가 바뀌어도 동작합니다.
+ */
+function getConfig() {
+  if (_configCache) return _configCache;
+
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CFG_SHEET_NAME);
+  if (!sheet) {
+    throw new Error(CFG_SHEET_NAME + ' 시트를 찾을 수 없습니다.');
+  }
+
+  var values = sheet.getDataRange().getValues();
+  var header = values[CFG_HEADER_ROW - 1];
+
+  var keyIdx = header.indexOf(CFG_KEY_COL_NAME);
+  var valIdx = header.indexOf(CFG_VAL_COL_NAME);
+  if (keyIdx === -1 || valIdx === -1) {
+    throw new Error('C_설정 헤더에서 "설정키" 또는 "설정값" 컬럼을 찾을 수 없습니다.');
+  }
+
+  var config = {};
+  for (var i = CFG_HEADER_ROW; i < values.length; i++) {
+    var key = String(values[i][keyIdx] || '').trim();
+    if (!key) continue;
+    config[key] = String(values[i][valIdx] === null ? '' : values[i][valIdx]).trim();
+  }
+
+  _configCache = config;
+  return config;
+}
+
+/**
+ * 설정값 하나를 가져옵니다. 없거나 비어 있으면 예외를 던집니다.
+ * 예: var adminEmail = cfg('ADMIN_EMAIL');
+ */
+function cfg(key) {
+  var v = getConfig()[key];
+  if (v === undefined) throw new Error('C_설정에 ' + key + ' 항목이 없습니다.');
+  if (v === '') throw new Error('C_설정의 ' + key + ' 값이 비어 있습니다.');
+  return v;
+}
+
+/** 숫자형 설정값. 예: cfgNum('MAX_FILE_SIZE_MB') → 20 */
+function cfgNum(key) {
+  var n = Number(cfg(key));
+  if (isNaN(n)) throw new Error('C_설정의 ' + key + ' 값이 숫자가 아닙니다.');
+  return n;
+}
+
+/** Y/N 설정값. 예: cfgBool('MAIL_ENABLED') → false */
+function cfgBool(key) {
+  return cfg(key).toUpperCase() === 'Y';
+}
+
+/** 비어 있어도 되는 설정값. 없으면 기본값(기본 '') 반환 */
+function cfgOpt(key, def) {
+  var v = getConfig()[key];
+  if (v === undefined || v === '') return (def === undefined ? '' : def);
+  return v;
+}
+
+// =============================================================
+//  2. 점검 함수 — 이걸 실행하세요
+// =============================================================
+
+function checkConfig() {
+  _configCache = null;   // 매번 새로 읽음
+
+  var errors = [];    // 반드시 고쳐야 하는 것
+  var warns = [];     // 확인해보면 좋은 것
+  var oks = [];       // 정상 확인된 것
+
+  var config;
+  try {
+    config = getConfig();
+  } catch (e) {
+    Logger.log('[치명] ' + e.message);
+    return;
+  }
+
+  oks.push('C_설정 시트에서 ' + Object.keys(config).length + '개 항목을 읽었습니다.');
+
+  // --- 2-1. 필수값 누락 ---
+  checkRequired_(config, errors);
+
+  // --- 2-2. 스프레드시트 ID 대조 ---
+  var actualSsId = SpreadsheetApp.getActive().getId();
+  if (!config.SS_DB_ID) {
+    errors.push('SS_DB_ID가 비어 있습니다.');
+  } else if (config.SS_DB_ID !== actualSsId) {
+    errors.push('SS_DB_ID가 이 스프레드시트와 다릅니다.\n' +
+                '       입력값: ' + config.SS_DB_ID + '\n' +
+                '       실제값: ' + actualSsId);
+  } else {
+    oks.push('SS_DB_ID 일치');
+  }
+
+  // --- 2-3. 공유드라이브 루트 ---
+  if (config.FOLDER_ROOT) {
+    if (config.FOLDER_ROOT.indexOf('0A') !== 0) {
+      warns.push('FOLDER_ROOT가 0A로 시작하지 않습니다. ' +
+                 '공유드라이브 ID가 아니라 일반 폴더 ID일 수 있습니다.');
+    } else {
+      oks.push('FOLDER_ROOT 형식 정상 (공유드라이브 ID)');
+    }
+  }
+
+  // --- 2-4. 폴더 5개 접근 + 이름 대조 ---
+  checkFolders_(config, errors, warns, oks);
+
+  // --- 2-5. 쓰기 권한 (01_증빙에 임시파일 생성 후 삭제) ---
+  checkWritePermission_(config, errors, oks);
+
+  // --- 2-6. 날짜 형식과 기간 정합성 ---
+  checkDates_(config, errors, warns, oks);
+
+  // --- 2-7. 숫자값 ---
+  NUMBER_KEYS.forEach(function (k) {
+    if (config[k] && isNaN(Number(config[k]))) {
+      errors.push(k + ' 값이 숫자가 아닙니다: "' + config[k] + '"');
+    }
+  });
+
+  // --- 2-8. 목록값 ---
+  Object.keys(ALLOWED_VALUES).forEach(function (k) {
+    var allowed = ALLOWED_VALUES[k];
+    if (config[k] && allowed.indexOf(config[k]) === -1) {
+      errors.push(k + ' 값은 ' + allowed.join(' 또는 ') +
+                  ' 이어야 합니다. 현재: "' + config[k] + '"');
+    }
+  });
+
+  // --- 2-9. 이메일 형식 ---
+  checkEmails_(config, errors, oks);
+
+  // --- 2-10. ADMIN_EMAIL이 M_사용자에 관리자로 등록되어 있는지 ---
+  checkAdminInUserMaster_(config, warns, oks);
+
+  // --- 2-11. 운영 모드 경고 ---
+  if (config.APP_MODE === '운영' && config.MAIL_ENABLED === 'Y') {
+    warns.push('APP_MODE=운영, MAIL_ENABLED=Y 입니다. ' +
+               '지금 상태에서 발송 기능을 돌리면 담당자에게 실제 메일이 나갑니다.');
+  }
+  if (config.MAIL_ENABLED === 'N') {
+    oks.push('MAIL_ENABLED=N — 메일이 실제로 발송되지 않습니다 (검증 단계에 적합)');
+  }
+
+  printResult_(errors, warns, oks);
+}
+
+
+// =============================================================
+//  3. 개별 점검 로직
+// =============================================================
+
+function checkRequired_(config, errors) {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CFG_SHEET_NAME);
+  var values = sheet.getDataRange().getValues();
+  var header = values[CFG_HEADER_ROW - 1];
+  var keyIdx = header.indexOf(CFG_KEY_COL_NAME);
+  var valIdx = header.indexOf(CFG_VAL_COL_NAME);
+  var reqIdx = header.indexOf(CFG_REQ_COL_NAME);
+  if (reqIdx === -1) return;
+
+  var seen = {};
+  for (var i = CFG_HEADER_ROW; i < values.length; i++) {
+    var key = String(values[i][keyIdx] || '').trim();
+    if (!key) continue;
+
+    if (seen[key]) {
+      errors.push('설정키가 중복되었습니다: ' + key +
+                  ' (' + seen[key] + '행, ' + (i + 1) + '행)');
+    }
+    seen[key] = i + 1;
+
+    var req = String(values[i][reqIdx] || '').trim().toUpperCase();
+    var val = String(values[i][valIdx] === null ? '' : values[i][valIdx]);
+    if (req === 'Y' && val.trim() === '') {
+      errors.push('필수값이 비어 있습니다: ' + key + ' (' + (i + 1) + '행)');
+    }
+    if (val !== val.trim() && val.trim() !== '') {
+      errors.push('앞뒤에 공백이 있습니다: ' + key + ' (' + (i + 1) + '행)');
+    }
+  }
+}
+
+function checkFolders_(config, errors, warns, oks) {
+  Object.keys(EXPECTED_FOLDER_NAMES).forEach(function (key) {
+    var id = config[key];
+    var expected = EXPECTED_FOLDER_NAMES[key];
+
+    if (!id) {
+      warns.push(key + ' 가 비어 있어 접근 확인을 건너뜁니다.');
+      return;
+    }
+    try {
+      var folder = DriveApp.getFolderById(id);
+      var name = folder.getName();
+      if (name !== expected) {
+        errors.push(key + ' 의 ID가 다른 폴더를 가리킵니다.\n' +
+                    '       기대한 폴더: ' + expected + '\n' +
+                    '       실제 폴더  : ' + name);
+      } else {
+        oks.push(key + ' → ' + name + ' (정상)');
+      }
+    } catch (e) {
+      errors.push(key + ' 폴더를 열 수 없습니다. ID를 확인하세요.\n' +
+                  '       입력값: ' + id + '\n' +
+                  '       오류  : ' + e.message);
+    }
+  });
+}
+
+function checkWritePermission_(config, errors, oks) {
+  if (!config.FOLDER_EVIDENCE) return;
+  var temp = null;
+  try {
+    var folder = DriveApp.getFolderById(config.FOLDER_EVIDENCE);
+    temp = folder.createFile('__권한점검_삭제해도됨.txt', 'test', MimeType.PLAIN_TEXT);
+    oks.push('01_증빙 폴더 쓰기 권한 정상');
+  } catch (e) {
+    errors.push('01_증빙 폴더에 파일을 만들 수 없습니다. ' +
+                '공유드라이브 권한을 확인하세요.\n       오류: ' + e.message);
+  } finally {
+    if (temp) {
+      try { temp.setTrashed(true); } catch (e2) {
+        errors.push('점검용 임시파일이 01_증빙에 남았습니다. 수동으로 삭제하세요: ' +
+                    '__권한점검_삭제해도됨.txt');
+      }
+    }
+  }
+}
+
+function checkDates_(config, errors, warns, oks) {
+  var pattern = /^\d{4}-\d{2}-\d{2}$/;
+  var parsed = {};
+
+  DATE_KEYS.forEach(function (k) {
+    var v = config[k];
+    if (!v) return;
+    if (!pattern.test(v)) {
+      errors.push(k + ' 는 YYYY-MM-DD 형식이어야 합니다. 현재: "' + v + '"\n' +
+                  '       셀 서식이 날짜형이면 일련번호로 읽힙니다. ' +
+                  '서식을 "일반 텍스트"로 바꾸고 다시 입력하세요.');
+      return;
+    }
+    parsed[k] = new Date(v + 'T00:00:00+09:00');
+  });
+
+  if (parsed.PERIOD_START && parsed.PERIOD_END) {
+    if (parsed.PERIOD_START >= parsed.PERIOD_END) {
+      errors.push('PERIOD_START가 PERIOD_END보다 늦거나 같습니다.');
+    } else {
+      oks.push('평가대상기간 정상: ' + config.PERIOD_START + ' ~ ' + config.PERIOD_END);
+    }
+  }
+
+  if (parsed.EVIDENCE_DUE_DATE && parsed.PERIOD_START) {
+    if (parsed.EVIDENCE_DUE_DATE < parsed.PERIOD_START) {
+      warns.push('EVIDENCE_DUE_DATE가 평가대상기간 시작일보다 빠릅니다.');
+    }
+    var today = new Date();
+    if (parsed.EVIDENCE_DUE_DATE < today) {
+      warns.push('EVIDENCE_DUE_DATE(' + config.EVIDENCE_DUE_DATE +
+                 ')가 이미 지났습니다. 새 기수를 시작한다면 갱신하세요.');
+    }
+  }
+
+  if (config.CURRENT_PERIOD && config.CURRENT_PERIOD === config.PREV_PERIOD) {
+    errors.push('CURRENT_PERIOD와 PREV_PERIOD가 같습니다. 전기 비교가 불가능합니다.');
+  }
+}
+
+function checkEmails_(config, errors, oks) {
+  var pattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  EMAIL_KEYS.forEach(function (k) {
+    var v = config[k];
+    if (!v) return;
+    var bad = v.split(',').map(function (s) { return s.trim(); })
+               .filter(function (s) { return s && !pattern.test(s); });
+    if (bad.length) {
+      errors.push(k + ' 의 이메일 형식이 잘못되었습니다: ' + bad.join(', '));
+    } else {
+      oks.push(k + ' 형식 정상');
+    }
+  });
+}
+
+function checkAdminInUserMaster_(config, warns, oks) {
+  var sheet = SpreadsheetApp.getActive().getSheetByName('M_사용자');
+  if (!sheet || !config.ADMIN_EMAIL) return;
+
+  var values = sheet.getDataRange().getValues();
+  var header = values[2];   // M_사용자도 3행이 헤더
+  var mailIdx = header.indexOf('이메일');
+  var roleIdx = header.indexOf('역할');
+  var stateIdx = header.indexOf('상태');
+  if (mailIdx === -1) return;
+
+  var found = false;
+  for (var i = 3; i < values.length; i++) {
+    var email = String(values[i][mailIdx] || '').trim().toLowerCase();
+    if (email !== config.ADMIN_EMAIL.toLowerCase()) continue;
+    found = true;
+    if (roleIdx !== -1 && String(values[i][roleIdx]).trim() !== '관리자') {
+      warns.push('ADMIN_EMAIL이 M_사용자에 있으나 역할이 "관리자"가 아닙니다.');
+    }
+    if (stateIdx !== -1 && String(values[i][stateIdx]).trim() === '삭제') {
+      warns.push('ADMIN_EMAIL의 M_사용자 상태가 "삭제"입니다.');
+    }
+    break;
+  }
+  if (!found) {
+    warns.push('ADMIN_EMAIL(' + config.ADMIN_EMAIL + ')이 M_사용자에 없습니다. ' +
+               '웹앱 로그인 시 관리자 권한이 잡히지 않습니다.');
+  } else {
+    oks.push('ADMIN_EMAIL이 M_사용자에 등록되어 있습니다.');
+  }
+
+  // 실행 계정과 관리자 계정이 같은지
+  var me = Session.getActiveUser().getEmail();
+  if (me && me.toLowerCase() !== config.ADMIN_EMAIL.toLowerCase()) {
+    warns.push('지금 실행 중인 계정(' + me + ')과 ADMIN_EMAIL이 다릅니다.');
+  }
+}
+
+
+// =============================================================
+//  4. 결과 출력
+// =============================================================
+
+function printResult_(errors, warns, oks) {
+  var lines = [];
+  lines.push('=========================================');
+  lines.push(' C_설정 점검 결과');
+  lines.push(' ' + Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH:mm:ss'));
+  lines.push('=========================================');
+  lines.push('');
+
+  if (errors.length) {
+    lines.push('■ 오류 ' + errors.length + '건 — 고쳐야 진행할 수 있습니다');
+    errors.forEach(function (m, i) { lines.push('  ' + (i + 1) + '. ' + m); });
+    lines.push('');
+  }
+  if (warns.length) {
+    lines.push('■ 경고 ' + warns.length + '건 — 의도한 것인지 확인하세요');
+    warns.forEach(function (m, i) { lines.push('  ' + (i + 1) + '. ' + m); });
+    lines.push('');
+  }
+  lines.push('■ 정상 ' + oks.length + '건');
+  oks.forEach(function (m) { lines.push('  · ' + m); });
+  lines.push('');
+  lines.push('-----------------------------------------');
+  lines.push(errors.length === 0
+    ? (warns.length === 0 ? '결과: 이상 없음' : '결과: 오류 없음 (경고 ' + warns.length + '건 확인 필요)')
+    : '결과: 오류 ' + errors.length + '건');
+  lines.push('=========================================');
+
+  var text = lines.join('\n');
+  Logger.log(text);
+
+  try {
+    SpreadsheetApp.getUi().alert('C_설정 점검 결과', text, SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (e) {
+    // 편집기에서 직접 실행한 경우 UI가 없습니다. 로그로만 확인하세요.
+  }
+}
+
+
+// =============================================================
+//  5. 메뉴 등록
+// =============================================================
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('ITGC 관리')
+    .addItem('C_설정 점검', 'checkConfig')
+    .addToUi();
+}
