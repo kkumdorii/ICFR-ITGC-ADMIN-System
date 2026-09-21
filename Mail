@@ -1,0 +1,548 @@
+/**
+ * Mail.gs — 담당자 요청메일 발송
+ *
+ * 발송유형 : 최초요청 / 독촉
+ * 발송구분 : 즉시 / 예약
+ *
+ * 안전장치
+ *   MAIL_ENABLED = N  → 실제로 보내지 않고 T_메일발송에 "미발송(테스트)"만 기록
+ *   APP_MODE = 테스트  → 수신자를 ADMIN_EMAIL 로 바꿔서 발송
+ */
+
+/* ─────────────── 대상 산출 ─────────────── */
+
+/**
+ * 담당자별 증빙 현황을 모은다.
+ * @param {string} kind 최초요청 | 독촉
+ */
+function getMailTargets(kind) {
+  try {
+    var period = cfg('CURRENT_PERIOD');
+    var users = {};
+    getRows('M_사용자').forEach(function (u) {
+      if (u['상태'] === '사용') users[u['사용자ID']] = u;
+    });
+    var euMap = {};
+    getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+
+    var up = {};
+    getRows('T_증빙파일').forEach(function (f) {
+      if (String(f['평가기수']) !== period || f['상태'] === '삭제') return;
+      up[String(f['정의ID'])] = (up[String(f['정의ID'])] || 0) + 1;
+    });
+
+    var byUser = {};
+    getRows('T_증빙정의').forEach(function (d) {
+      if (d['상태'] !== '사용') return;
+      var uid = String(d['담당자ID'] || '');
+      if (!uid) return;
+      var eu = euMap[String(d['평가단위ID'])] || {};
+      if (!byUser[uid]) byUser[uid] = { total: 0, done: 0, groups: {} };
+      var b = byUser[uid];
+      b.total++;
+      var done = !!up[String(d['정의ID'])];
+      if (done) b.done++;
+      var k = String(d['평가단위ID']);
+      if (!b.groups[k]) {
+        b.groups[k] = { euId: k, control: eu['통제코드'] || '', target: eu['대상명'] || k,
+                        layer: eu['대상 레이어'] || '', items: [] };
+      }
+      b.groups[k].items.push({
+        defId: d['정의ID'], seq: d['증빙순번'], type: d['증빙유형'],
+        desc: d['증빙설명'], ext: d['허용확장자'], method: d['모집단추출방법'],
+        required: d['필수여부'], done: done
+      });
+    });
+
+    /* 마지막 발송 이력 */
+    var lastSent = {}, sentCnt = {};
+    getRows('T_메일발송').forEach(function (m) {
+      if (String(m['평가기수']) !== period) return;
+      if (m['상태'] !== '발송완료' && m['상태'] !== '미발송(테스트)') return;
+      var uid = String(m['수신자ID']);
+      var at = String(m['발송일시'] || '');
+      if (!lastSent[uid] || at > lastSent[uid]) lastSent[uid] = at;
+      sentCnt[uid] = (sentCnt[uid] || 0) + 1;
+    });
+
+    var maxCnt = Number(cfg('REMIND_MAX_COUNT') || 2);
+    var gap = Number(cfg('REMIND_INTERVAL_DAYS') || 4);
+    var now = new Date();
+
+    var out = [];
+    Object.keys(byUser).forEach(function (uid) {
+      var u = users[uid], b = byUser[uid];
+      var todo = b.total - b.done;
+      if (kind === '독촉' && todo === 0) return;          /* 다 낸 사람은 독촉 제외 */
+
+      var warn = [];
+      if (!u) warn.push('M_사용자에 없는 담당자ID');
+      else if (!u['이메일']) warn.push('이메일 없음');
+      var last = lastSent[uid] || '';
+      var cnt = sentCnt[uid] || 0;
+      var canSend = true;
+      if (kind === '독촉') {
+        if (cnt >= maxCnt + 1) { warn.push('독촉 ' + maxCnt + '회 초과'); canSend = false; }
+        if (last) {
+          var d = (now - _parseDt(last)) / 86400000;
+          if (d < gap) { warn.push('최근 발송 후 ' + gap + '일 미경과'); canSend = false; }
+        }
+      }
+      out.push({
+        userId: uid, name: u ? u['성명'] : uid, dept: u ? u['소속부서'] : '',
+        email: u ? u['이메일'] : '', total: b.total, done: b.done, todo: todo,
+        groupCount: Object.keys(b.groups).length,
+        lastSent: last, sentCount: cnt,
+        canSend: canSend && !!(u && u['이메일']), warn: warn.join(' · ')
+      });
+    });
+    out.sort(function (a, b) { return b.todo - a.todo; });
+
+    return {
+      ok: true, kind: kind, period: period,
+      dueDate: cfg('EVIDENCE_DUE_DATE'),
+      mailEnabled: cfg('MAIL_ENABLED'), appMode: cfg('APP_MODE'),
+      adminEmail: cfg('ADMIN_EMAIL'), webappUrl: cfgOpt('WEBAPP_URL'),
+      targets: out
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+function _parseDt(s) {
+  var m = String(s).match(/(\d{4})-(\d{2})-(\d{2})[ T]?(\d{2})?:?(\d{2})?/);
+  if (!m) return new Date(0);
+  return new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0));
+}
+
+/* ─────────────── 참조 수신자 ─────────────── */
+
+/**
+ * 참조(CC) 대상을 만든다.
+ *   1) 수신자와 같은 소속부서의 팀장 (M_사용자.팀장여부 = Y)
+ *   2) C_설정 CC_EMAIL 에 지정된 상시 참조자 (쉼표 구분)
+ * 수신자 본인과 중복은 제외한다.
+ */
+function _normDept(v) {
+  /* 앞뒤 공백·중간 공백·전각 공백을 모두 지우고 비교한다 */
+  return String(v == null ? '' : v).replace(/[\s\u00A0\u3000]/g, '');
+}
+
+function _ccList(dept, selfEmail) {
+  var seen = {}, out = [], leaders = [];
+  var add = function (e) {
+    e = String(e || '').trim();
+    if (!e) return;
+    var k = e.toLowerCase();
+    if (k === String(selfEmail || '').toLowerCase() || seen[k]) return;
+    seen[k] = 1; out.push(e);
+  };
+  var want = _normDept(dept);
+  getRows('M_사용자').forEach(function (u) {
+    if (String(u['상태']).trim() !== '사용') return;
+    if (String(u['팀장여부']).trim().toUpperCase() !== 'Y') return;
+    leaders.push({ name: u['성명'], dept: u['소속부서'], email: u['이메일'] });
+    if (_normDept(u['소속부서']) !== want) return;
+    add(u['이메일']);
+  });
+  var leaderCnt = out.length;
+  String(cfgOpt('CC_EMAIL') || '').split(',').forEach(add);
+  return { list: out, leaderCount: leaderCnt, dept: dept, leaders: leaders };
+}
+
+/* ─────────────── 본문 ─────────────── */
+
+function _esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** 담당자 1명에게 보낼 제목과 본문을 만든다 */
+function buildMail(userId, kind) {
+  var t = getMailTargets(kind);
+  if (!t.ok) throw new Error(t.error);
+  var me = null;
+  t.targets.forEach(function (x) { if (String(x.userId) === String(userId)) me = x; });
+  if (!me) throw new Error('발송 대상이 아닙니다: ' + userId);
+
+  var period = cfg('CURRENT_PERIOD');
+  var due = String(cfg('EVIDENCE_DUE_DATE') || '').substring(0, 10);
+  var url = String(cfgOpt('WEBAPP_URL') || '').trim();
+  /* 메일에서 들어오면 바로 증빙제출 화면이 열리도록 한다 */
+  if (url) url += (url.indexOf('?') >= 0 ? '&' : '?') + 'v=up';
+  var contact = cfgOpt('MAIL_CONTACT') || '';
+
+  /* 담당 증빙을 평가단위별로 다시 모은다 */
+  var euMap = {};
+  getRows('T_평가단위').forEach(function (r) { euMap[String(r['평가단위ID'])] = r; });
+  var upl = {};
+  getRows('T_증빙파일').forEach(function (f) {
+    if (String(f['평가기수']) !== period || f['상태'] === '삭제') return;
+    upl[String(f['정의ID'])] = 1;
+  });
+  var infMap = {};
+  getRows('M_인프라').forEach(function (x) { infMap[String(x['인프라ID'])] = x; });
+  var pst = String(cfg('PERIOD_START')).substring(0, 10);
+  var pen = String(cfg('PERIOD_END')).substring(0, 10);
+  var tdy = now_().substring(0, 10);
+
+  var groups = {}, order = [];
+  getRows('T_증빙정의').forEach(function (d) {
+    if (d['상태'] !== '사용' || String(d['담당자ID']) !== String(userId)) return;
+    var k = String(d['평가단위ID']);
+    if (!groups[k]) {
+      var eu = euMap[k] || {};
+      groups[k] = { euId: k, control: eu['통제코드'] || '', target: eu['대상명'] || k, items: [] };
+      order.push(k);
+    }
+    groups[k].items.push({
+      seq: d['증빙순번'], type: d['증빙유형'], desc: d['증빙설명'],
+      ext: d['허용확장자'], method: d['모집단추출방법'],
+      range: _evRange(d, euMap[k], infMap, pst, pen, tdy).label,
+      done: !!upl[String(d['정의ID'])]
+    });
+  });
+
+  var remind = (kind === '독촉');
+  var subject = cfg('MAIL_SUBJECT_PREFIX') + ' ' + period + ' 증빙 ' +
+    (remind ? '제출 요청 (미제출 ' + me.todo + '건, ~' + due + ')'
+            : '제출 요청 (' + me.total + '건, ~' + due + ')');
+
+  var B = '#2482C8', D = '#203864', G = '#5A6E78', L = '#DCE6F0';
+  var h = '';
+  h += '<div style="font-family:\'맑은 고딕\',Malgun Gothic,sans-serif;background:#F3F7FB;padding:24px 0">';
+  h += '<div style="max-width:680px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid ' + L + '">';
+
+  /* 헤더 */
+  h += '<div style="background:' + D + ';padding:26px 30px">' +
+       '<div style="color:#A9C4E0;font-size:12px;margin-bottom:9px">다우기술 리스크관리팀</div>' +
+       '<span style="display:inline-block;background:' + B + ';color:#fff;font-size:11.5px;' +
+       'padding:4px 11px;border-radius:20px;margin-right:6px">내부회계관리제도</span>' +
+       '<span style="display:inline-block;background:' + (remind ? '#B8860B' : '#1E7E68') +
+       ';color:#fff;font-size:11.5px;padding:4px 11px;border-radius:20px">' +
+       (remind ? '미제출 안내' : 'ITGC 증빙 요청') + '</span>' +
+       '<div style="color:#fff;font-size:20px;font-weight:bold;line-height:1.45;margin-top:14px">' +
+       period + ' 내부회계관리제도 ITGC<br>증빙 제출을 요청드립니다</div></div>';
+
+  h += '<div style="padding:26px 30px">';
+  h += '<div style="font-size:12px;color:' + G + ';line-height:1.8;margin-bottom:16px">' +
+       '※ 본 메일은 담당자별 개별 발송 메일입니다.<br>' +
+       '※ 제출하실 증빙은 아래 목록과 같으며, 관리자시스템에서 직접 올리실 수 있습니다.</div>';
+
+  var cnt = remind ? me.todo : me.total;
+  h += '<div style="font-size:14px;line-height:1.9;color:#2B323D">' +
+       '안녕하세요, ' + _esc(me.name) + '님. 리스크관리팀입니다.<br>' +
+       (remind
+         ? period + ' 내부회계관리제도 ITGC 증빙 중 <b>' + cnt + '건</b>이 아직 제출되지 않았습니다.'
+         : period + ' 내부회계관리제도 ITGC 평가를 위한 증빙 <b>' + cnt + '건</b>을 요청드립니다.') +
+       '<br><b style="color:#C0392B">' + due + '</b> 까지 제출 부탁드립니다.</div>';
+
+  h += '<div style="background:#F3F7FB;border-radius:10px;padding:16px 18px;margin:18px 0">' +
+       '<table style="width:100%;font-size:13px;color:#2B323D"><tr>' +
+       '<td style="padding:3px 0;color:' + G + ';width:110px">제출 기한</td>' +
+       '<td style="padding:3px 0;font-weight:bold;color:#C0392B">' + due + ' 까지</td></tr>' +
+       '<tr><td style="padding:3px 0;color:' + G + '">대상 증빙</td>' +
+       '<td style="padding:3px 0;font-weight:bold">' + me.total + '건' +
+       (remind ? ' (미제출 ' + me.todo + '건)' : '') + '</td></tr>' +
+       '<tr><td style="padding:3px 0;color:' + G + '">평가단위</td>' +
+       '<td style="padding:3px 0;font-weight:bold">' + order.length + '개</td></tr></table></div>';
+
+  /* 증빙 목록 */
+  h += '<div style="font-size:15px;font-weight:bold;color:' + D + ';margin:22px 0 10px">' +
+       '<span style="display:inline-block;width:21px;height:21px;background:' + D +
+       ';color:#fff;border-radius:50%;text-align:center;line-height:21px;font-size:12px;' +
+       'margin-right:7px">1</span>제출하실 증빙 <span style="font-size:12px;font-weight:normal;color:' + G + '">총 ' + me.total + '건' + (remind ? ' 중 미제출 ' + me.todo + '건' : '') + '</span></div>';
+
+  h += '<div style="border:1px solid ' + L + ';border-radius:10px;overflow:hidden">';
+  order.forEach(function (k, gi) {
+    var g = groups[k];
+    var gdone = g.items.filter(function (x) { return x.done; }).length;
+    var full = (gdone === g.items.length);
+    h += '<div style="' + (gi ? 'border-top:1px solid ' + L + ';' : '') + 'padding:13px 16px">' +
+         '<div style="font-size:13.5px;font-weight:bold;color:' + D + '">' + _esc(g.target) +
+         '<span style="float:right;font-size:11.5px;font-weight:bold;color:' +
+         (full ? '#1E7E68' : '#B8860B') + '">' + gdone + ' / ' + g.items.length + '</span></div>' +
+         '<div style="font-size:11px;color:' + G + ';margin:2px 0 7px">' +
+         _esc(g.euId) + ' · ' + _esc(g.control) + '</div>';
+    g.items.sort(function (a, b) { return a.seq - b.seq; }).forEach(function (it) {
+      var ok = it.done;
+      h += '<div style="font-size:13px;color:' + (ok ? G : '#2B323D') + ';line-height:1.95">' +
+           '<span style="color:' + (ok ? '#1E7E68' : '#B8860B') + ';font-weight:bold;margin-right:7px">' +
+           (ok ? '\u2713' : '\u25CB') + '</span>' + _esc(it.type) +
+           (ok ? '<span style="font-size:11px;color:#1E7E68;margin-left:7px">제출 완료</span>' : '') +
+           '</div>' +
+           (it.range ? '<div style="font-size:11.5px;color:' + G + ';padding-left:18px;' +
+             'line-height:1.6;margin-bottom:3px">조회 기간 : ' + _esc(it.range) + '</div>' : '');
+    });
+    h += '</div>';
+  });
+  h += '</div>';
+  h += '<div style="font-size:11.5px;color:' + G + ';line-height:1.8;margin-top:9px">' +
+       '각 증빙의 상세 안내와 파일 형식, 과거 예시는 관리자시스템에서 확인하실 수 있습니다.</div>';
+
+  /* 제출 방법 */
+  h += '<div style="font-size:15px;font-weight:bold;color:' + D + ';margin:26px 0 10px">' +
+       '<span style="display:inline-block;width:21px;height:21px;background:' + D +
+       ';color:#fff;border-radius:50%;text-align:center;line-height:21px;font-size:12px;' +
+       'margin-right:7px">2</span>제출 방법</div>';
+  h += '<div style="border:1px solid ' + L + ';border-radius:10px;padding:16px 18px;font-size:13px;' +
+       'line-height:1.9;color:#2B323D">' +
+       '<b>\u2460 아래 버튼을 눌러 관리자시스템에 접속합니다.</b><br>' +
+       '<span style="color:' + G + ';font-size:12px">회사 계정으로 자동 로그인되며, 본인 담당 증빙만 표시됩니다.</span><br><br>' +
+       '<b>\u2461 제출할 항목을 클릭합니다.</b><br>' +
+       '<span style="color:' + G + ';font-size:12px">카드 테두리가 파랗게 바뀌면 선택된 것입니다.</span><br><br>' +
+       '<b>\u2462 화면을 캡처하거나 조회 결과를 복사한 뒤 Ctrl+V 를 누릅니다.</b><br>' +
+       '<span style="color:' + G + ';font-size:12px">' +
+       '· 캡처 : <b>Win + Shift + S</b> 로 영역을 지정한 뒤 그대로 Ctrl+V<br>' +
+       '· 조회 결과 : 표를 복사(Ctrl+C)한 뒤 Ctrl+V — 엑셀 파일로 자동 저장됩니다<br>' +
+       '· 파일이 이미 있다면 [파일 선택] 후 [업로드] 를 눌러도 됩니다</span><br><br>' +
+       '<b>\u2463 미리보기를 확인하고 [저장] 을 누릅니다.</b><br>' +
+       '<span style="color:' + G + ';font-size:12px">저장 전까지는 반영되지 않습니다. 잘못 붙여넣었으면 [취소] 를 누르십시오.</span><br><br>' +
+       '<b>\u2464 [제출 완료] 표시를 확인합니다.</b><br>' +
+       '<span style="color:' + G + ';font-size:12px">' +
+       '각 항목에 [과거 예시] 가 있으면 눌러서 이전 사이클 증빙을 참고하실 수 있습니다.</span>' +
+       '</div>';
+
+  if (url) {
+    h += '<div style="text-align:center;margin:24px 0 8px">' +
+         '<a href="' + _esc(url) + '" style="display:inline-block;background:' + B +
+         ';color:#fff;text-decoration:none;font-size:14px;font-weight:bold;' +
+         'padding:13px 34px;border-radius:8px">증빙 제출하러 가기 \u2197</a></div>';
+  }
+
+  h += '<div style="border-top:1px solid ' + L + ';margin-top:24px;padding-top:16px;' +
+       'font-size:11.5px;color:' + G + ';line-height:1.8">' +
+       '본 요청은 내부회계관리제도 ITGC 평가 절차에 따른 것입니다.<br>' +
+       '제출하신 증빙은 외부감사인에게 제출되는 평가 조서의 근거자료로 사용됩니다.<br>' +
+       (contact ? '문의 : ' + _esc(contact) : '') + '</div>';
+
+  h += '</div></div></div>';
+  var cc = _ccList(me.dept, me.email);
+  return { subject: subject, html: h, target: me, cc: cc.list,
+           ccInfo: { leaderCount: cc.leaderCount, dept: cc.dept, leaders: cc.leaders } };
+}
+
+/** 화면 미리보기용 */
+function previewMail(userId, kind) {
+  try {
+    var m = buildMail(userId, kind);
+    return { ok: true, subject: m.subject, html: m.html, target: m.target, cc: m.cc, ccInfo: m.ccInfo };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/* ─────────────── 발송 ─────────────── */
+
+function _logMail(o) {
+  return withLock(function () {
+    var id = nextId('T_메일발송', '발송ID', 'ML-', 6);
+    appendRow('T_메일발송', {
+      '발송ID': id,
+      '평가기수': cfg('CURRENT_PERIOD'),
+      '발송유형': o.kind, '발송구분': o.mode,
+      '예약일시': o.when || '', '발송일시': o.sentAt || '',
+      '수신자ID': o.userId, '수신자명': o.name, '소속부서': o.dept,
+      '수신이메일': o.email,
+      '대상증빙': o.total, '미제출건수': o.todo,
+      '제목': o.subject || '', '상태': o.status,
+      '오류메시지': o.error || '', '트리거ID': o.trigger || '',
+      '참조': o.cc || '',
+      '요청자ID': o.by || ''
+    });
+    return id;
+  });
+}
+
+/** 즉시 발송 */
+function sendMailNow(userIds, kind) {
+  try {
+    var enabled = String(cfg('MAIL_ENABLED')).toUpperCase() === 'Y';
+    var test = String(cfg('APP_MODE')) === '테스트';
+    var admin = cfg('ADMIN_EMAIL');
+    var me = currentUser();
+    var res = [];
+
+    (userIds || []).forEach(function (uid) {
+      var rec = { kind: kind, mode: '즉시', userId: uid, by: me ? me['사용자ID'] : '' };
+      try {
+        var m = buildMail(uid, kind);
+        rec.name = m.target.name; rec.dept = m.target.dept; rec.email = m.target.email;
+        rec.total = m.target.total; rec.todo = m.target.todo; rec.subject = m.subject;
+        if (!m.target.email) throw new Error('이메일 주소가 없습니다');
+
+        if (!enabled) {
+          rec.status = '미발송(테스트)';
+          rec.sentAt = now_();
+        } else {
+          var to = test ? admin : m.target.email;
+          var cc = test ? '' : (m.cc || []).join(',');
+          MailApp.sendEmail({
+            to: to, cc: cc,
+            subject: (test ? '[테스트] ' : '') + m.subject,
+            htmlBody: m.html,
+            name: cfg('MAIL_SENDER_NAME')
+          });
+          rec.status = '발송완료';
+          rec.sentAt = now_();
+          rec.email = to;
+          rec.cc = cc;
+        }
+      } catch (e) {
+        rec.status = '발송실패'; rec.error = e.message; rec.sentAt = now_();
+      }
+      rec.id = _logMail(rec);
+      res.push({ userId: uid, name: rec.name, status: rec.status, error: rec.error || '' });
+    });
+
+    return {
+      ok: true, results: res,
+      sent: res.filter(function (x) { return x.status === '발송완료'; }).length,
+      test: res.filter(function (x) { return x.status === '미발송(테스트)'; }).length,
+      failed: res.filter(function (x) { return x.status === '발송실패'; }).length
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * 예약 발송
+ * @param {string} when 'yyyy-MM-dd HH:mm'
+ */
+function scheduleMail(userIds, kind, when) {
+  try {
+    var dt = _parseDt(when);
+    if (!dt || isNaN(dt.getTime())) throw new Error('예약 일시를 확인하십시오');
+    if (dt - new Date() < 60000) throw new Error('현재 시각보다 1분 이상 뒤로 지정하십시오');
+
+    var tr = ScriptApp.newTrigger('runScheduledMail').timeBased().at(dt).create();
+    var tid = tr.getUniqueId();
+    var me = currentUser();
+    var users = {};
+    getRows('M_사용자').forEach(function (u) { users[u['사용자ID']] = u; });
+    var t = getMailTargets(kind);
+    var byId = {};
+    if (t.ok) t.targets.forEach(function (x) { byId[x.userId] = x; });
+
+    var n = 0;
+    (userIds || []).forEach(function (uid) {
+      var x = byId[uid] || {};
+      var u = users[uid] || {};
+      _logMail({
+        kind: kind, mode: '예약', when: when, userId: uid,
+        name: u['성명'] || uid, dept: u['소속부서'] || '', email: u['이메일'] || '',
+        total: x.total || 0, todo: x.todo || 0,
+        status: '예약', trigger: tid, by: me ? me['사용자ID'] : ''
+      });
+      n++;
+    });
+    return { ok: true, count: n, when: when, triggerId: tid };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 예약 트리거가 실행하는 함수. 기한이 지난 예약을 모두 처리한다 */
+function runScheduledMail() {
+  var now = new Date();
+  var rows = getRows('T_메일발송').filter(function (m) {
+    return m['상태'] === '예약' && m['예약일시'] && _parseDt(m['예약일시']) <= now;
+  });
+  if (!rows.length) return;
+
+  var enabled = String(cfg('MAIL_ENABLED')).toUpperCase() === 'Y';
+  var test = String(cfg('APP_MODE')) === '테스트';
+  var admin = cfg('ADMIN_EMAIL');
+
+  rows.forEach(function (m) {
+    var status = '발송완료', err = '', to = m['수신이메일'], subject = '', ccs = '';
+    try {
+      var built = buildMail(m['수신자ID'], m['발송유형']);
+      subject = built.subject;
+      if (!built.target.email) throw new Error('이메일 주소가 없습니다');
+      if (!enabled) {
+        status = '미발송(테스트)';
+      } else {
+        to = test ? admin : built.target.email;
+        ccs = test ? '' : (built.cc || []).join(',');
+        MailApp.sendEmail({
+          to: to, cc: ccs,
+          subject: (test ? '[테스트] ' : '') + subject,
+          htmlBody: built.html,
+          name: cfg('MAIL_SENDER_NAME')
+        });
+      }
+    } catch (e) {
+      status = '발송실패'; err = e.message;
+    }
+    updateCell('T_메일발송', m._row, '상태', status);
+    updateCell('T_메일발송', m._row, '발송일시', now_());
+    if (subject) updateCell('T_메일발송', m._row, '제목', subject);
+    if (to) updateCell('T_메일발송', m._row, '수신이메일', to);
+    try { updateCell('T_메일발송', m._row, '참조', ccs); } catch (e) { }
+    if (err) updateCell('T_메일발송', m._row, '오류메시지', err);
+  });
+
+  _cleanTriggers();
+}
+
+/** 이미 처리된 일회성 트리거를 지운다 */
+function _cleanTriggers() {
+  var live = {};
+  getRows('T_메일발송').forEach(function (m) {
+    if (m['상태'] === '예약' && m['트리거ID']) live[String(m['트리거ID'])] = 1;
+  });
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'runScheduledMail' && !live[t.getUniqueId()]) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+/** 예약 취소 */
+function cancelSchedule(mailIds) {
+  try {
+    var n = 0;
+    (mailIds || []).forEach(function (id) {
+      var r = findRow('T_메일발송', '발송ID', id);
+      if (!r || r['상태'] !== '예약') return;
+      updateCell('T_메일발송', r._row, '상태', '취소');
+      n++;
+    });
+    _cleanTriggers();
+    return { ok: true, count: n };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 예약 목록 + 발송 이력 */
+function getMailHistory() {
+  try {
+    var period = cfg('CURRENT_PERIOD');
+    var rows = getRows('T_메일발송')
+      .filter(function (m) { return String(m['평가기수']) === period; })
+      .map(function (m) {
+        return {
+          id: m['발송ID'], kind: m['발송유형'], mode: m['발송구분'],
+          when: m['예약일시'], sentAt: m['발송일시'],
+          userId: m['수신자ID'], name: m['수신자명'], dept: m['소속부서'],
+          email: m['수신이메일'], total: m['대상증빙'], todo: m['미제출건수'],
+          subject: m['제목'], cc: m['참조'] || '', status: m['상태'], error: m['오류메시지']
+        };
+      });
+    rows.sort(function (a, b) {
+      var x = String(b.sentAt || b.when || ''), y = String(a.sentAt || a.when || '');
+      return x < y ? -1 : (x > y ? 1 : 0);
+    });
+    return {
+      ok: true,
+      scheduled: rows.filter(function (r) { return r.status === '예약'; }),
+      history: rows.filter(function (r) { return r.status !== '예약'; })
+    };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
