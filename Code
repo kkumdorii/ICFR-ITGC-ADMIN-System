@@ -1,0 +1,35 @@
+/**
+ * Code.gs — 웹앱 진입점
+ *
+ * 배포: 새 배포 > 웹 앱
+ *   실행 계정   : 나
+ *   액세스 권한 : 다우기술 도메인 사용자   ← Anyone 선택 금지 (사내 인프라 정보 포함)
+ */
+
+function doGet(e) {
+  var t = HtmlService.createTemplateFromFile('index');
+  t.appName = cfg('APP_NAME') || '내부회계관리제도 관리자시스템';
+  return t.evaluate()
+    .setTitle(t.appName)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/** index.html 에서 부분 템플릿을 끼워 넣을 때 사용 */
+function include(name) {
+  return HtmlService.createHtmlOutputFromFile(name).getContent();
+}
+
+/** 에디터에서 직접 실행해 동작을 확인하는 용도 */
+function devCheck() {
+  var b = getBootstrap();
+  Logger.log('bootstrap ok=%s 평가단위=%s 시스템=%s 인프라=%s',
+    b.ok, b.counts && b.counts.evalUnit, b.counts && b.counts.system, b.counts && b.counts.infra);
+  var h = getHealthCheck();
+  Logger.log('health ok=%s error=%s warn=%s', h.ok, h.summary && h.summary.error, h.summary && h.summary.warn);
+  if (h.integrity) {
+    h.integrity.slice(0, 20).forEach(function (x) {
+      Logger.log('  [%s] %s %s — %s', x.level, x.sheet, x.id, x.msg);
+    });
+  }
+}
