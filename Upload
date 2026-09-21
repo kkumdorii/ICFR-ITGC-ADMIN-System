@@ -154,6 +154,7 @@ function getMyEvidence(userId) {
           ext: d['허용확장자'], method: d['모집단추출방법'],
           control: eu['통제코드'] || '', target: eu['대상명'] || '',
           rangeLabel: _evRange(d, eu, infMap, pst, pen, tdy).label,
+          refId: String(d['참조정의ID'] || '').trim(),
           exUrl: d['예시파일URL'] || '', exId: _driveId(d['예시파일URL']),
           exText: d['예시내용'] || '', exDesc: d['예시설명'] || '',
           files: files[String(d['정의ID'])] || []
